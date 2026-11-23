@@ -485,13 +485,12 @@ describe("combo request cloning", () => {
     expect(debug).toHaveBeenCalledTimes(1);
     expect(debug.mock.calls[0]?.[1]).toEqual({
       provider: "a",
-      model: "m1",
       requestedEffort: "high",
       capability: "unsupported",
     });
     concreteComboRequestBody({ model: "combo/x" }, target, "medium", undefined);
     concreteComboRequestBody({ model: "combo/x" }, target, "medium", undefined);
-    expect(debug).toHaveBeenCalledTimes(2);
+    expect(debug).toHaveBeenCalledTimes(2); expect(debug.mock.calls[0]?.[1]).not.toHaveProperty("model"); expect(debug.mock.calls[1]?.[1]).not.toHaveProperty("model");
     expect(debug.mock.calls[1]?.[1]).toMatchObject({
       requestedEffort: "medium",
       capability: "unknown",
@@ -796,7 +795,7 @@ describe("combo target cooldowns", () => {
       expect(sleeps).toEqual([3_000]);
       expect(pick?.target).toMatchObject({ provider: "b", model: "m2" });
       expect(warning).toHaveBeenCalledWith(
-        "[combo] free: all targets cooling, waiting 3000ms for b/m2",
+        "[combo] combo 1: all targets cooling, waiting 3000ms for target 2 (b)",
       );
     } finally {
       warning.mockRestore();
@@ -946,7 +945,8 @@ describe("combo failure policy and advancement", () => {
     }
     expect(comboFailureDecision(400, "context_length_exceeded")).toBe("hop");
     expect(comboFailureDecision(403, '{"code":"origin_rejected"}')).toBe("stop");
-    expect(comboFailureDecision(413, "request too large")).toBe("stop");
+    // A provider 413 is that target's intake limit (#9017): the next target may accept it.
+    expect(comboFailureDecision(413, "request too large")).toBe("hop");
     expect(comboFailureDecision(409, "conflict")).toBe("stop");
     expect(comboFailureDecision(410, "resource is gone")).toBe("stop");
     expect(comboFailureDecision(410, "The model has reached its end of life and is no longer available.")).toBe("hop");
@@ -965,7 +965,7 @@ describe("combo failure policy and advancement", () => {
     expect(comboFailureDecision(400, 'upstream mentions input_admission_refused in prose')).toBe('stop');
     // An UPSTREAM context verdict is target-local in a heterogeneous combo: this model cannot
     // hold the turn, but a later one may have a larger window. The whole message being the bare
-    // token is unambiguous evidence; a generic 413 with no context signal stays conservative.
+    // token is unambiguous evidence. A provider 413 hops on its status alone (#9017).
     expect(comboFailureDecision(400, "context_length_exceeded")).toBe("hop");
     // Evidence has to come from the MESSAGE. A context code beside an unrelated refusal is a
     // contradictory envelope, and a hard structured refusal outranks the context verdict.
@@ -979,7 +979,7 @@ describe("combo failure policy and advancement", () => {
     }});
     expect(comboFailureDecision(400, providerHardCap, { code: "5059" })).toBe("hop");
     expect(comboFailureDecision(400, "ordinary invalid request", { code: "5059" })).toBe("stop");
-    expect(comboFailureDecision(413, "request too large")).toBe("stop");
+    expect(comboFailureDecision(410, "resource is gone")).toBe("stop");
   });
 
   test("free-tier and monthly quota failures hop with the right scope, without weakening generic 400 handling", () => {
@@ -1635,12 +1635,17 @@ describe("combo validation and normalization", () => {
       defaultEffort: "high",
       defaultEffortMode: "fallback",
       reasoningEffortMode: "strict",
+      jevEffortMode: "decide",
       imageInput: "auto",
       alias: null,
       nativeAlias: false,
       displayName: null,
       targets: [{ provider: "a", model: "m1", weight: 2, lastResort: false, metered: false }],
     });
+    // Only the exact "client" literal hands a JEV combo's wire effort to the caller (#8041).
+    const jevTargets = [{ provider: "a", model: "m1" }];
+    expect(normalizeComboConfig({ strategy: "jev", jevEffortMode: "client", targets: jevTargets }).jevEffortMode).toBe("client");
+    expect(normalizeComboConfig({ strategy: "jev", jevEffortMode: "Client" as never, targets: jevTargets }).jevEffortMode).toBe("decide");
     expect(normalizeComboConfig({ targets: [{ provider: "a", model: "m1" }] }).defaultEffort).toBeNull();
     const targetReasoningEfforts: OcxComboDefaultEffort[] = ["low", "high"];
     const normalizedTargetEfforts = normalizeComboConfig({

@@ -2,6 +2,7 @@ import type { OcxConfig } from "../types";
 import { MAX_HUB_USAGE_BYTES, parseHubUsage } from "../remote/hub-usage";
 import { parseRange, parseUsageSurface, USAGE_RANGES, USAGE_SURFACES } from "../usage/summary";
 import { parseUsageTimeWindow } from "../usage/time-range";
+import { USAGE_SOURCE_CLIENTS, type UsageSourceClient } from "../usage/source-filter";
 import { getFilteredUsageAggregate } from "./management/usage-aggregate-cache";
 import { isAllowedRequestOrigin, resolveDataPlaneAdmissionSecret, withCors, type DataPlaneAdmissionOptions, type RequestPolicyView } from "./auth-cors";
 
@@ -18,18 +19,34 @@ export async function handleHubUsage(req: Request, config: OcxConfig, policy: Re
   if (!isAllowedRequestOrigin(req, policy)) return error("origin_rejected", "Cross-origin request blocked", 403);
   if (config.runtimeRole !== "hub") return error("hub_usage_not_a_hub", "Usage is served here only by a hub", 404);
   const keyId = admission.keyId;
+  const stillAdmitted = () => {
+    const current = resolveDataPlaneAdmissionSecret(token, config, "dedicated", options);
+    return current?.kind === "configured" && current.keyId === keyId;
+  };
+  return withCors(await serveKeyScopedHubUsage(new URL(req.url).searchParams, keyId, stillAdmitted), req, policy);
+}
+
+/** Shared projection for authorized Hub clients, with a post-read enrollment check. */
+export async function serveKeyScopedHubUsage(
+  query: URLSearchParams, keyId: string, stillAdmitted: () => boolean,
+): Promise<Response> {
+  const reply = (body: unknown, status = 200) => Response.json(body, {
+    status, headers: { "cache-control": "no-store" },
+  });
+  const error = (code: string, message: string, status: number) => reply({ error: { code, message } }, status);
   // The existing aggregate filter trims IDs. Never let that normalization turn
   // this authenticated identity into another configured key (or no filter).
   if (!keyId || keyId.trim() !== keyId) return error("hub_usage_key_id_invalid", "Client key identity needs repair on the hub", 403);
-  const query = new URL(req.url).searchParams;
-  const allowed = new Set(["range", "surface", "provider", "model", "since", "until"]);
+  const allowed = new Set(["range", "surface", "provider", "model", "since", "until", "client"]);
   for (const key of query.keys()) {
     if (!allowed.has(key) || query.getAll(key).length !== 1) return error("hub_usage_query_invalid", "Unknown or repeated usage option", 400);
   }
   const rangeInput = query.get("range") ?? "30d";
   const surfaceInput = query.get("surface") ?? "all";
+  const client = query.get("client");
   if (!(rangeInput === "1d" || (USAGE_RANGES as readonly string[]).includes(rangeInput))
-    || !(USAGE_SURFACES as readonly string[]).includes(surfaceInput)) {
+    || !(USAGE_SURFACES as readonly string[]).includes(surfaceInput)
+    || (client !== null && (!(USAGE_SOURCE_CLIENTS as readonly string[]).includes(client) || surfaceInput !== "all"))) {
     return error("hub_usage_query_invalid", "Invalid usage range or surface", 400);
   }
   let window;
@@ -38,13 +55,14 @@ export async function handleHubUsage(req: Request, config: OcxConfig, policy: Re
   try {
     const aggregate = await getFilteredUsageAggregate({
       apiKeyId: keyId, provider: query.get("provider"), model: query.get("model"),
+      ...(client !== null ? { sourceFilter: { client: client as UsageSourceClient, device: { kind: "key", id: keyId } } } : {}),
     }, window);
-    const current = resolveDataPlaneAdmissionSecret(token, config, "dedicated", options);
-    if (current?.kind !== "configured" || current.keyId !== keyId) {
+    if (!stillAdmitted()) {
       return error("hub_usage_unauthorized", "The client key changed during the read", 401);
     }
     const summary = aggregate.accumulator.summarize(parseRange(rangeInput), Date.now(), parseUsageSurface(surfaceInput));
     const body = parseHubUsage({ ...summary, schemaVersion: 1, source: "hub", scope: "client",
+      ...(client !== null ? { sourceFilter: { client, scope: "authenticated-key" } } : {}),
       ...(aggregate.usageIncomplete ? { usageIncomplete: true, usageIncompleteReason: "oversized_rows" } : {}),
     });
     if (!body) return error("hub_usage_unavailable", "Usage could not be represented; narrow the requested range", 503);

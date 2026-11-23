@@ -5,6 +5,11 @@ import { readBoundedResponseBytes } from "../lib/bounded-body";
 import { clearableDeadline } from "../lib/abort";
 import type { Desktop3pModelEntry } from "../claude/desktop-3p";
 import { assertDesktop3pModelsValid } from "../claude/desktop-3p-guard";
+import {
+  HUB_RELAY_CREDENTIAL_PATH, HUB_RELAY_ENROLLMENT_ID_HEADER, HUB_RELAY_ENROLLMENT_PROOF_HEADER,
+  HUB_RELAY_REVOCATION_HEADER, hubRelayDigest, hubRelayEnrollmentProof,
+} from "../remote/hub-management-relay";
+import { parseHubCredential, type HubRelayCredential } from "./hub-session";
 
 /** Hub traffic may cross loopback or authenticated HTTPS, and nothing else. */
 function isHubTransportPermitted(origin: string): boolean {
@@ -374,6 +379,39 @@ function assertRotationAuthorityOrigin(origin: string, credential: { kind: "admi
   }
 }
 
+export async function requestHubRelayCredential(
+  managementUrl: string, authority: Parameters<typeof rotationManagementHeaders>[0], keyId: string, key: string,
+  fetchImpl = fetch,
+): Promise<HubRelayCredential> {
+  const origin = normalizeHubOrigin(managementUrl);
+  assertRotationAuthorityOrigin(origin, authority);
+  const headers = rotationManagementHeaders(authority);
+  headers.set(HUB_RELAY_ENROLLMENT_ID_HEADER, keyId);
+  headers.set(HUB_RELAY_ENROLLMENT_PROOF_HEADER, hubRelayEnrollmentProof(key, keyId, "issue"));
+  const response = await fetchBounded(fetchImpl, origin + HUB_RELAY_CREDENTIAL_PATH, { method: "POST", headers }, undefined);
+  if (response.status !== 201) throw new HubClientError("hub_relay_issue_refused", "Hub refused relay credential issuance", response.status);
+  const value = parseJson(await boundedText(response, 1024), "hub_relay_credential_invalid");
+  const token = value && typeof value === "object" && "token" in value ? value.token : undefined;
+  const parsed = parseHubCredential({ kind: "relay", token });
+  if (!parsed) throw new HubClientError("hub_relay_credential_invalid", "Hub returned an invalid relay credential", response.status);
+  return parsed;
+}
+
+export async function revokeHubRelayLease(
+  managementUrl: string, keyId: string, key: string, credential: HubRelayCredential, fetchImpl = fetch,
+): Promise<void> {
+  const digest = hubRelayDigest(credential.token);
+  const response = await fetchBounded(fetchImpl, normalizeHubOrigin(managementUrl) + HUB_RELAY_CREDENTIAL_PATH, {
+    method: "DELETE",
+    headers: {
+      [HUB_RELAY_ENROLLMENT_ID_HEADER]: keyId,
+      [HUB_RELAY_ENROLLMENT_PROOF_HEADER]: hubRelayEnrollmentProof(key, keyId, "revoke", digest),
+      [HUB_RELAY_REVOCATION_HEADER]: digest,
+    },
+  }, 2_000);
+  if (response.status !== 204) throw new HubClientError("hub_relay_revoke_refused", "Hub did not acknowledge relay revocation", response.status);
+}
+
 export async function startClientKeyRotation(
   managementUrl: string,
   credential: { kind: "admin"; value: Uint8Array } | { kind: "gui-session"; value: ConnectGuiSession },
@@ -513,6 +551,11 @@ export async function fetchHubUsage(
   const text = await boundedText(response, MAX_HUB_USAGE_BYTES, { inactivityTimeoutMs: safeTimeout(options.timeoutMs) });
   const report = parseHubUsage(parseJson(text, "hub_usage_invalid"));
   if (!report) throw new HubClientError("hub_usage_invalid", "Hub usage response was invalid");
+  const requestedClient = query.get("client");
+  if (requestedClient !== null && (query.getAll("client").length !== 1
+    || report.sourceFilter?.client !== requestedClient || report.sourceFilter.scope !== "authenticated-key")) {
+    throw new HubClientError("hub_usage_invalid", "Hub usage source filter was not confirmed");
+  }
   return report;
 }
 

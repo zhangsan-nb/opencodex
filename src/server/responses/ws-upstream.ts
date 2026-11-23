@@ -1,3 +1,4 @@
+import { codexWsIncrementalHasRetainedState, codexWsIncrementalUploadEnabled, prepareIncrementalFrame } from "./codex-ws-incremental";
 import { OPENAI_API_RESPONSES_URL } from "./native-response-control";
 import { isInjectionRequest } from "./native-injection-protocol";
 import type { NativeResponseControl } from "./native-response-control";
@@ -18,9 +19,11 @@ import type { NativeResponseControl } from "./native-response-control";
 import { codexWsReuseAcrossTurnsEnabled } from "../../config/codex-ws-reuse-setting";
 import { compareBunVersions } from "../../lib/bun-stream-caps";
 import { resolveProxyRoute, socks5ProxyFromEnv } from "../../lib/proxy-env";
+import { estimateTokens } from "../../lib/token-estimate";
 import type { CodexWsQuotaObserver } from "./codex-ws-metadata";
 import { CODEX_RESPONSES_HTTP_URL, CODEX_RESPONSES_WS_URL, CODEX_WS_FRAME_HEADERS, prepareCodexHttpInit, prepareCodexWsRequest } from "./codex-ws-request";
 import { codexWsExchange } from "./codex-ws-exchange";
+import { TURN_STATE_BINDING_INIT } from "../turn-state-handles";
 import { CodexWsSession } from "./codex-ws-session";
 import { codexWsPool, codexWsReuseIdentity } from "./codex-ws-pool";
 import { codexWsCreateFrameExceedsLimit, type CodexWsPreOutputRefusalHold } from "./codex-ws-wire";
@@ -107,6 +110,7 @@ export function planCodexWsDial(
     else if (Object.hasOwn(headers, name)) dialHeaders[name] = headers[name]!;
     else delete dialHeaders[name];
   }
+  if (reuseAcrossTurns && codexWsIncrementalUploadEnabled()) delete dialHeaders["x-client-request-id"];
   const dial = { ...rewritten, headers: dialHeaders };
   if (dial.url === wsUrl || isLoopbackUrl(dial.url)) return dial;
   let destination: URL;
@@ -162,9 +166,15 @@ export async function codexWsUpstreamFetch(
   beforeDispatch?: (headers: Headers) => void,
   nativeControl?: NativeResponseControl,
   beforeContinuation?: () => Promise<void>,
-  onPhysicalDispatch?: () => void,
+  onPhysicalDispatch?: (body: BodyInit | null | undefined) => void,
   /** Opt-in pre-output refusal hold (#6969); see codexWsExchange. */
   preOutputRefusalHold?: CodexWsPreOutputRefusalHold,
+  onContinuationDispatch?: (frame: { body: Record<string, unknown>; text: string }) => void,
+  explicitProxy?: string,
+  /** Trusted admitted caller (codexWsCallerKey); scopes pooled sockets and incremental prefixes. */
+  caller?: string,
+  recoverPhysicalSend?: (send: () => Promise<void>, estimatedInputTokens: number) => Promise<boolean>,
+  providerName?: string,
 ): Promise<Response> {
   const prepared = prepareCodexWsRequest(url, init);
   if (!prepared) return sseFallback(url, prepareCodexHttpInit(url, init));
@@ -195,12 +205,16 @@ export async function codexWsUpstreamFetch(
   // streaming Response, so the oversized close can only be surfaced as a stream
   // error — and a resend at that point could double-generate. Measuring the
   // frame we are about to send keeps the whole failure mode unreachable.
-  if (codexWsCreateFrameExceedsLimit(frameText)) {
+  // An oversized frame dials only when some socket already holds an acknowledged prefix that
+  // could turn it into a delta; a cold oversized create goes straight to SSE.
+  // Without an admitted caller there is no prefix this request may inherit or seed.
+  const incrementalEligible = codexWsIncrementalUploadEnabled() && prepared.canonical && !control && caller !== undefined;
+  if ((!incrementalEligible || !codexWsIncrementalHasRetainedState()) && codexWsCreateFrameExceedsLimit(frameText)) {
     return sseFallback(url, init);
   }
 
   const wsUrl = wsUpstreamUrlFor(url);
-  const proxyRoute = resolveProxyRoute(new URL(wsUrl));
+  const proxyRoute = explicitProxy ? { kind: "proxy" as const, proxy: explicitProxy } : resolveProxyRoute(new URL(wsUrl));
   if (proxyRoute.kind === "fallback") return sseFallback(url, init);
   const proxy = proxyRoute.kind === "proxy" ? proxyRoute.proxy : undefined;
   // A genuine caller `originator` is already in these headers via the forward
@@ -223,12 +237,12 @@ export async function codexWsUpstreamFetch(
     // headers and its proxy are all part of the reuse identity, so a pooled socket is never
     // reused for a different destination or with stale plugin headers.
     const dial = planCodexWsDial(wsUrl, headers, proxy);
-    if (!dial) return sseFallback(url, init);
+    if (!dial || (explicitProxy && (dial.url !== wsUrl || dial.proxy !== explicitProxy))) return sseFallback(url, init);
     // The final dial headers, after plugin rewrites, are what the WebSocket upstream receives; the
     // per-turn headers planning drops from the upgrade still reach it inside the frame metadata.
     outboundCredentials().remember(headers);
     outboundCredentials().remember(dial.headers);
-    const identity = control ? null : codexWsReuseIdentity(url, dial.headers, frameText, dial.proxy, dial.url);
+    const identity = control ? null : codexWsReuseIdentity(url, dial.headers, frameText, dial.proxy, dial.url, caller, providerName);
     const reuseAcrossTurns = identity !== null && codexWsReuseAcrossTurnsEnabled();
     const pooled = identity
       ? reuseAcrossTurns
@@ -246,11 +260,28 @@ export async function codexWsUpstreamFetch(
   } catch {
     return sseFallback(url, init);
   }
+  const incrementalPlan = incrementalEligible ? prepareIncrementalFrame(session, frameText, caller) : undefined;
+  const outboundPrepared = incrementalPlan ? { ...prepared, frameText: incrementalPlan.frameText } : prepared;
+  if (codexWsCreateFrameExceedsLimit(outboundPrepared.frameText)) {
+    session.dispose();
+    return sseFallback(url, init);
+  }
   return codexWsExchange({
-    session, url, init, prepared, sseFallback, onQuota, beforeDispatch,
+    session, url, init, prepared: outboundPrepared, incrementalPlan, sseFallback, onQuota, beforeDispatch,
     nativeControl: control,
-    beforeContinuation, onPhysicalDispatch,
+    // The exchange reports the frame that actually leaves: the delta for an incremental send,
+    // the full create for its cache-miss recovery (#8453 replay guard).
+    beforeContinuation, onPhysicalDispatch, onContinuationDispatch,
+    recoverPhysicalSend: recoverPhysicalSend && (send => recoverPhysicalSend(send, estimateTokens(frameText, prepared.model))),
     preOutputRefusalHold,
     bunVersion: typeof runtime === "string" ? runtime : runtime.version,
+    metadataContext: codexWsMetadataContext(init, prepared.model),
   });
+}
+
+/** The binding the provider fetch attached to this send, and the requested model, for relayed metadata. */
+function codexWsMetadataContext(init: RequestInit, model: string | undefined): { turnStateBinding?: string; knownModels: string[]; provider: string } {
+  const binding = (init as Record<symbol, unknown>)[TURN_STATE_BINDING_INIT];
+  // This upstream is the ChatGPT Codex backend, so its bundled model catalog also counts as known.
+  return { ...(typeof binding === "string" ? { turnStateBinding: binding } : {}), knownModels: model ? [model] : [], provider: "openai-codex" };
 }

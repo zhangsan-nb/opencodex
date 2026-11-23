@@ -20,6 +20,8 @@ export const OCX_REASONING_PREFIX = "ocxr1:";
 export interface ReasoningEnvelope {
   /** Anthropic thinking-block signature (signature_delta), if captured. */
   sig?: string;
+  /** Immediately preceding output item owned by this late turn signature. */
+  aft?: string;
   /** ID of the immediately following commentary copy of this signed thinking block. */
   upd?: string;
   /** Raw redacted_thinking block data payloads, order preserved. */
@@ -29,6 +31,8 @@ export interface ReasoningEnvelope {
    * so replay needs it even though the visible summary was suppressed.
    */
   txt?: string;
+  /** The item's visible summary is a display copy of the raw text in `txt`. */
+  rawSummary?: true;
   /**
    * Kiro's reasoning blob from `reasoningContentEvent`: a KMS-encrypted value that is opaque to the
    * proxy (the GPT-5.6 family sends it as `signature`, other models as the base64
@@ -147,6 +151,8 @@ export function decodeReasoningEnvelope(encryptedContent: string, budget?: Trans
       const obj = parsed as { sig?: unknown; red?: unknown };
       const envelope: ReasoningEnvelope = {};
       if (typeof obj.sig === "string") envelope.sig = obj.sig;
+      const aft = (parsed as { aft?: unknown }).aft;
+      if (typeof aft === "string" && aft.length > 0) envelope.aft = aft;
       const upd = (parsed as { upd?: unknown }).upd;
       if (typeof upd === "string" && /^msg_[a-f0-9]{32}$/.test(upd)) envelope.upd = upd;
       if (Array.isArray(obj.red)) {
@@ -156,6 +162,7 @@ export function decodeReasoningEnvelope(encryptedContent: string, budget?: Trans
       const txt = (parsed as { txt?: unknown }).txt;
       const hasTxt = typeof txt === "string";
       if (hasTxt) envelope.txt = txt;
+      if (hasTxt && (parsed as { rawSummary?: unknown }).rawSummary === true) envelope.rawSummary = true;
       const krc = (parsed as { krc?: unknown }).krc;
       if (typeof krc === "string" && krc.length > 0) envelope.krc = krc;
       const nat = decodeNativeReasoning((parsed as { nat?: unknown }).nat);

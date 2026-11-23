@@ -1,3 +1,4 @@
+import { MessagesSseFrameContext, messagesSseFrameHooks, messagesSseLocalFrame } from "../lib/messages-sse-error-presentation";
 import { anthropicErrorBody } from "../claude/outbound";
 import { redactSecretString } from "../lib/redact";
 import { sseFieldValue } from "../lib/sse-decoder";
@@ -49,8 +50,10 @@ export function guardNativeMessagesEmptyToolCatalog(
   budget: TranslatorBudget,
   onRefusal: (message: string) => void,
   declared: ReadonlySet<string> = NO_DECLARED_TOOLS,
+  frames?: MessagesSseFrameContext,
 ): ReadableStream<Uint8Array> {
   const reader = source.getReader();
+  const hooks = frames ? messagesSseFrameHooks(frames) : undefined;
   const decoder = new TextDecoder();
   const encoder = new TextEncoder();
   const scope = { kind: "live_transient" as const };
@@ -61,20 +64,25 @@ export function guardNativeMessagesEmptyToolCatalog(
   const permittedInputBlocks = new Set<number>();
   let queuedBytes = 0;
   let settled = false;
+  let pendingLineFeed = false;
   const releaseQueued = () => {
     budget.releaseRetained(queuedBytes, scope);
     queuedBytes = 0;
   };
   const clear = () => {
+    hooks?.dispose();
     buffer.clear();
     budget.releaseRetained(permittedInputBlocks.size * 32, scope);
     permittedInputBlocks.clear();
   };
-  const enqueue = (controller: ReadableStreamDefaultController<Uint8Array>, text: string) => {
+  const enqueue = (controller: ReadableStreamDefaultController<Uint8Array>, text: string, original?: string, refusal = false) => {
     const bytes = Buffer.byteLength(text);
     const reservation = budget.reserveTransient(bytes, scope);
     try {
-      controller.enqueue(encoder.encode(text));
+      const encoded = encoder.encode(text);
+      if (refusal) frames?.register(encoded, { client: messagesSseLocalFrame("guard", "") });
+      else if (original !== undefined) hooks?.output(original, encoded);
+      controller.enqueue(encoded);
       reservation.commitRetained();
       queuedBytes += bytes;
     } catch (error) {
@@ -110,9 +118,9 @@ export function guardNativeMessagesEmptyToolCatalog(
         && (index === undefined || !permittedInputBlocks.has(index))) name ??= "<unnamed>";
       if (name !== undefined) {
         clear();
-        const message = redactSecretString(undeclaredToolCallMessage(name));
+        const message = redactSecretString(undeclaredToolCallMessage());
         onRefusal(message);
-        enqueue(controller, `event: error\ndata: ${JSON.stringify(anthropicErrorBody(502, message, "api_error", UNDECLARED_TOOL_CALL_ERROR_CODE))}\n\n`);
+        enqueue(controller, `event: error\ndata: ${JSON.stringify(anthropicErrorBody(502, message, "api_error", UNDECLARED_TOOL_CALL_ERROR_CODE))}\n\n`, undefined, true);
         settled = true;
         cancelReader(new Error(message));
         controller.close();
@@ -129,7 +137,8 @@ export function guardNativeMessagesEmptyToolCatalog(
         budget.releaseRetained(32, scope);
       }
     }
-    enqueue(controller, block + delimiter);
+    const frame = block + delimiter;
+    enqueue(controller, frame, frame);
     if (terminal) {
       settled = true;
       clear();
@@ -145,6 +154,7 @@ export function guardNativeMessagesEmptyToolCatalog(
         for (;;) {
           const block = buffer.next();
           if (block) {
+            pendingLineFeed = block.delimiter.endsWith("\r") && buffer.isEmpty();
             buffer.compact();
             process(controller, block.block, block.delimiter);
             return;
@@ -152,7 +162,18 @@ export function guardNativeMessagesEmptyToolCatalog(
           const { done, value } = await reader.read();
           if (settled) return;
           if (!done) {
-            buffer.append(decoder.decode(value, { stream: true }));
+            hooks?.input(value, buffer.isEmpty(), !buffer.isEmpty() && buffer.endsWithLineFeed(), pendingLineFeed);
+            const fragment = decoder.decode(value, { stream: true });
+            if (pendingLineFeed && fragment.length > 0) {
+              pendingLineFeed = false;
+              if (fragment.startsWith("\n")) {
+                // This LF extends an emitted delimiter and carries no frame origin.
+                buffer.append(fragment.slice(1));
+                enqueue(controller, "\n");
+                return;
+              }
+            }
+            buffer.append(fragment);
             continue;
           }
           buffer.append(decoder.decode());

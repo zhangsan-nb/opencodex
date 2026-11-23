@@ -1,3 +1,4 @@
+import { clientFacingModelLabel } from "../../src/lib/error-destination";
 import { afterEach, describe, expect, test } from "bun:test";
 import {
   ADVISOR_INTERNAL_CAPABILITY_HEADER,
@@ -19,6 +20,8 @@ import { executeResponsesSidecars } from "../../src/server/responses/sidecar-exe
 import { setAdvisorPlanFactory } from "../../src/server/responses/advisor-plan-slot";
 import { assertRouteAllowedByScope, resolveAdmissionModelScope } from "../../src/server/admission-model-scope";
 
+const workerProvider = { adapter: "openai-chat", baseUrl: "https://worker.invalid/v1", authMode: "key" } as const;
+
 afterEach(() => {
   setInternalCallCapabilityForTests(null);
 });
@@ -39,7 +42,7 @@ describe("internal-call capability — server-owned authority", () => {
       setAdvisorPlanFactory(config, async input => {
         observed = true;
         expect(input.admissionScope).toBe(captured);
-        expect(() => assertRouteAllowedByScope(input.admissionScope, "advisor/private", {
+        expect(() => assertRouteAllowedByScope(input.admissionScope, clientFacingModelLabel("advisor/private"), {
           providerName: "advisor", modelId: "private",
         })).toThrow("not allowed");
         // Stop at the real factory seam; downstream dispatch is not exercised.
@@ -49,12 +52,12 @@ describe("internal-call capability — server-owned authority", () => {
       const requestContext = { config, options: { admission }, logCtx: {} } as Args[0];
       const requestState = {
         parsed: parseRequest({ model: "worker/cheap", input: [{ role: "user", content: "task" }] }),
-        route: { providerName: "worker", modelId: "cheap" }, admissionScope: captured,
+        route: { providerName: "worker", modelId: "cheap", provider: workerProvider }, admissionScope: captured,
       } as Args[1];
       // Controlled async boundary on a prepared-state fixture. Full request
       // preparation/transport is intentionally not invoked by this seam test.
       const pending = barrier.promise.then(() => executeResponsesSidecars(
-        requestContext, requestState, { adapter: {} } as Args[2],
+        requestContext, requestState, { adapter: {}, initialAdapterProvider: workerProvider } as Args[2],
         { routedCompaction: false } as Args[3], {} as Args[4], {} as Args[5],
       ));
       try {
@@ -95,7 +98,7 @@ describe("internal-call capability — server-owned authority", () => {
         // a fallback to either live config or a later caller-owned option.
         expect(input.admissionScope).toBe(captured);
         if (snapshot === "undefined") expect(input.admissionScope).toBeUndefined();
-        else expect(() => assertRouteAllowedByScope(input.admissionScope, "advisor/private", {
+        else expect(() => assertRouteAllowedByScope(input.admissionScope, clientFacingModelLabel("advisor/private"), {
           providerName: "advisor", modelId: "private",
         })).toThrow("not allowed");
         throw reachedFactory;
@@ -103,10 +106,10 @@ describe("internal-call capability — server-owned authority", () => {
       const requestContext = { config, options, logCtx: {} } as Args[0];
       const requestState = {
         parsed: parseRequest({ model: "worker/cheap", input: [{ role: "user", content: "task" }] }),
-        route: { providerName: "worker", modelId: "cheap" }, admissionScope: captured,
+        route: { providerName: "worker", modelId: "cheap", provider: workerProvider }, admissionScope: captured,
       } as Args[1];
       const pending = barrier.promise.then(() => executeResponsesSidecars(
-        requestContext, requestState, { adapter: {} } as Args[2],
+        requestContext, requestState, { adapter: {}, initialAdapterProvider: workerProvider } as Args[2],
         { routedCompaction: false } as Args[3], {} as Args[4], {} as Args[5],
       ));
       try {

@@ -1,4 +1,6 @@
-import { clearAllAnthropicFamilyQuota, anthropicModelQuotaFor, anthropicModelPercents, anthropicModelWeeklyPercent } from "./anthropic-model-quota";
+import { clearAllAnthropicFamilyQuota, anthropicModelQuotaFor, anthropicModelPercents, anthropicModelRankPercent, anthropicModelWeeklyPercent } from "./anthropic-model-quota";
+import { resetNearWeightOf } from "../routing/machine-weighted-routing";
+import { getAnthropicResetNearQuota } from "../providers/quota/account-cache";
 /**
  * Opt-in Anthropic OAuth account pool (#294).
  *
@@ -274,6 +276,8 @@ export type AnthropicCooldownRecoveryClaim = Readonly<{
   accountId: string;
   cooldownGeneration: number;
   claimedAt: number;
+  /** False for a reset-derived refusal that named no window: a usage read can only retain it. */
+  namesRejectedWindow: boolean;
 }>;
 
 export type AnthropicCooldownRecoverySettlement = "cleared" | "retained" | "superseded";
@@ -349,6 +353,9 @@ type RoutingFacadeSymbol =
   | "promoteAnthropicActiveAccount"
   | "commitAnthropicSelectionRouting"
   | "resetAnthropicRoutingForManualSelection"
+  | "flushAnthropicManualSelectionReset"
+  | "resetAnthropicSessionAffinityConfirmed"
+  | "flushAnthropicAccountPause"
   | "getAnthropicPoolAccessToken"
   | "getAnthropicPoolAccessSnapshot"
   | "canRefreshAnthropicPoolAccount";
@@ -372,6 +379,7 @@ function createAnthropicRouting(instance: AnthropicInstanceId): AnthropicRouting
   // The startup baseline comes from the authoritative store, never a second persisted pin.
   let manualPreference: OAuthAccountSelection | null | undefined;
   let manualSelectionGeneration = 0;
+  let manualResetPending = false;
   /** Automatic pointer moves preserve affinity; manual selection revokes older bindings. */
   function captureAnthropicManualSelectionGeneration(): number { return manualSelectionGeneration; }
 
@@ -430,8 +438,9 @@ function createAnthropicRouting(instance: AnthropicInstanceId): AnthropicRouting
     now = Date.now(),
   ): AnthropicCooldownRecoveryClaim | null {
     const entry = upstreamHealth.get(accountId);
-    if (!entry || entry.cooldownUntil <= now || recoverableQuotaWindows(entry) === null) return null;
-    return { instance, accountId, cooldownGeneration: entry.cooldownGeneration, claimedAt: now };
+    const windows = entry && entry.cooldownUntil > now ? recoverableQuotaWindows(entry) : null;
+    if (!entry || windows === null) return null;
+    return { instance, accountId, cooldownGeneration: entry.cooldownGeneration, claimedAt: now, namesRejectedWindow: windows.length > 0 };
   }
 
   /**
@@ -530,6 +539,7 @@ function createAnthropicRouting(instance: AnthropicInstanceId): AnthropicRouting
     sessionAffinity.resetMemory();
     manualPreference = undefined;
     manualSelectionGeneration++;
+    manualResetPending = false;
     quorumCache = null;
   }
 
@@ -579,9 +589,16 @@ function createAnthropicRouting(instance: AnthropicInstanceId): AnthropicRouting
     }
   }
 
-  function usageScore(config: OcxConfig, accountId: string, model?: string): number {
+  /**
+   * `rank` compares accounts, restating a family allowance on the weekly scale where the configured
+   * window ranks on weekly usage. Five-hour ranking has no five-hour tie-break, so a fresh Fable
+   * seat's 50 would mask every lower five-hour reading there; it and thresholds keep the family's own percent.
+   */
+  function usageScore(config: OcxConfig, accountId: string, model?: string, rank = false): number {
     if (model) {
-      const family = anthropicModelWeeklyPercent(getCachedProviderAccountQuota(PROVIDER, accountId), model);
+      const quota = getCachedProviderAccountQuota(PROVIDER, accountId);
+      const weeklyScale = rank && anthropicQuotaWindow(anthropicAccountPoolConfig(config)) !== "five-hour";
+      const family = weeklyScale ? anthropicModelRankPercent(quota, model) : anthropicModelWeeklyPercent(quota, model);
       if (family === undefined) return usageScore(config, accountId);
       return hasKnownUsage(config, accountId) ? Math.max(family, usageScore(config, accountId)) : family;
     }
@@ -799,7 +816,7 @@ function createAnthropicRouting(instance: AnthropicInstanceId): AnthropicRouting
     const scored: ScoredAccount[] = eligible.map(accountId => ({
       accountId,
       hasKnownUsage: hasKnownUsage(config, accountId, model),
-      score: usageScore(config, accountId, model),
+      score: usageScore(config, accountId, model, true),
       fiveHourTieBreak: window === "five-hour" ? 0 : fiveHourScore(accountId),
       // Every window EXCEPT the legacy five-hour default is an explicit opt-in, so
       // known-before-unknown applies to all of them and to none of the default path.
@@ -866,13 +883,18 @@ function createAnthropicRouting(instance: AnthropicInstanceId): AnthropicRouting
     if (!admitted(config)) return null;
     const strategy = isAnthropicAccountPoolEnabled(config) ? anthropicPoolStrategy(config) : "quota";
     const eligible = routeCandidates(getEligibleAnthropicAccounts(now, model), decision).filter(id => id !== excludeId && !excludedAccountIds?.has(id));
-    if (strategy === "round-robin") {
-      return peekRoundRobinAccount(poolKey, eligible, stickyLimitForPool(config));
+    if (strategy === "round-robin" || strategy === "reset-near-weighted") {
+      const weightOf = strategy === "reset-near-weighted" ? anthropicResetNearWeightOf(eligible, now) : undefined;
+      return peekRoundRobinAccount(poolKey, eligible, stickyLimitForPool(config), weightOf);
     }
     if (strategy === "fill-first") {
       return pickNextFillFirstAnthropicAccount(config, excludeId, eligible, decision, model);
     }
     return pickLowestUsage(config, excludeId, now, decision, model, excludedAccountIds);
+  }
+
+  function anthropicResetNearWeightOf(eligible: readonly string[], now: number) {
+    return resetNearWeightOf(eligible, id => getAnthropicResetNearQuota(PROVIDER, id, now), now);
   }
 
   function stickyLimitForPool(config: OcxConfig): number {
@@ -931,11 +953,13 @@ function createAnthropicRouting(instance: AnthropicInstanceId): AnthropicRouting
     const strategy = anthropicPoolStrategy(config);
     if (strategy === "quota") return null;
 
-    if (strategy === "round-robin") {
+    if (strategy === "round-robin" || strategy === "reset-near-weighted") {
       const eligible = routeCandidates(getEligibleAnthropicAccounts(now, model), decision);
       const limit = stickyLimitForPool(config);
       const headroom = model ? eligible.filter(id => !anthropicModelExhausted(id, model)) : eligible;
-      const picked = peekRoundRobinAccount(poolKey, headroom.length ? headroom : eligible, limit);
+      const candidates = headroom.length ? headroom : eligible;
+      const weightOf = strategy === "reset-near-weighted" ? anthropicResetNearWeightOf(candidates, now) : undefined;
+      const picked = peekRoundRobinAccount(poolKey, candidates, limit, weightOf);
       if (!picked) return null;
       return { accountId: picked, reason: "round-robin" };
     }
@@ -1029,9 +1053,8 @@ function createAnthropicRouting(instance: AnthropicInstanceId): AnthropicRouting
 
     const strategy = anthropicPoolStrategy(config);
     // No session identity (Desktop turns without a sticky key): hold the current
-    // active under RR/fill-first instead of treating every turn as a new session.
-    // Round-robin only when there is a real new-session key (or active is unusable).
-    if (!key && (strategy === "round-robin" || strategy === "fill-first")) {
+    // active for new-session rotation strategies while it can still serve the turn.
+    if (!key && (strategy === "round-robin" || strategy === "fill-first" || strategy === "reset-near-weighted")) {
       const activeOk = set.accounts.some(a => a.id === set.activeAccountId && a.needsReauth !== true)
         && !isCooled(set.activeAccountId, now)
         && eligible.includes(set.activeAccountId) && (!model || !anthropicModelExhausted(set.activeAccountId, model));
@@ -1285,9 +1308,16 @@ function createAnthropicRouting(instance: AnthropicInstanceId): AnthropicRouting
     const current = captureOAuthAccountSelection(PROVIDER);
     if (current?.accountId !== committed.accountId || current.revision !== committed.revision) return false;
     if (isAnthropicAccountPoolEnabled(options.config)) {
-      if (anthropicPoolStrategy(options.config) === "round-robin" && options.reason !== "affinity") {
+      const rotationStrategy = anthropicPoolStrategy(options.config);
+      const weighted = rotationStrategy === "reset-near-weighted";
+      if (options.reason !== "affinity" && (rotationStrategy === "round-robin" || (weighted && options.reason !== "active"))) {
         const limit = stickyLimitForPool(options.config);
-        const picked = pickRoundRobinAccount(poolKey, routeCandidates(getEligibleAnthropicAccounts(Date.now(), options.model), options.routeDecision ?? null), limit);
+        const now = Date.now();
+        const eligible = routeCandidates(getEligibleAnthropicAccounts(now, options.model), options.routeDecision ?? null);
+        const headroom = weighted && options.model ? eligible.filter(id => !anthropicModelExhausted(id, options.model)) : eligible;
+        const candidates = headroom.length ? headroom : eligible;
+        const weightOf = weighted ? anthropicResetNearWeightOf(candidates, now) : undefined;
+        const picked = pickRoundRobinAccount(poolKey, candidates, limit, weightOf);
         if (picked !== accountId) seedPoolRotationAccount(poolKey, accountId);
         notePoolRotationSuccess(poolKey, accountId, limit);
       }
@@ -1314,18 +1344,44 @@ function createAnthropicRouting(instance: AnthropicInstanceId): AnthropicRouting
     return true;
   }
 
+  function requestAnthropicSessionAffinityReset(): void {
+    sessionAffinity.clear();
+    manualSelectionGeneration++;
+    manualResetPending = true;
+  }
+
   /**
    * Manual selection resets session affinity and seeds the RR ring so the next
    * unbound new session honors the operator-chosen account (Codex parity).
    */
   function resetAnthropicRoutingForManualSelection(accountId: string): void {
-    sessionAffinity.clear();
-    manualSelectionGeneration++;
+    requestAnthropicSessionAffinityReset();
     manualPreference = captureOAuthAccountSelection(PROVIDER);
     seedPoolRotationAccount(poolKey, accountId);
     // A manual account selection is an operator statement about the roster; do not answer the
     // next activation question from a count read before it.
     quorumCache = null;
+  }
+
+  async function flushAnthropicManualSelectionReset(): Promise<boolean> {
+    if (!manualResetPending) return true;
+    const generation = manualSelectionGeneration;
+    const persisted = await sessionAffinity.flushConfirmed();
+    if (persisted && generation === manualSelectionGeneration) manualResetPending = false;
+    return persisted && generation === manualSelectionGeneration;
+  }
+
+  /** Complete a reset without selecting, resuming or requiring an account. */
+  async function resetAnthropicSessionAffinityConfirmed(): Promise<boolean> {
+    requestAnthropicSessionAffinityReset();
+    return flushAnthropicManualSelectionReset();
+  }
+
+  /** Publish pause invalidation without clearing bindings of unrelated eligible accounts. */
+  async function flushAnthropicAccountPause(): Promise<boolean> {
+    sessionAffinity.invalidate(); // Also hydrates when the pause event preceded this routing owner.
+    if (manualResetPending) return flushAnthropicManualSelectionReset();
+    return sessionAffinity.flushConfirmed();
   }
 
   /**
@@ -1439,7 +1495,7 @@ function createAnthropicRouting(instance: AnthropicInstanceId): AnthropicRouting
     resolveAnthropicAccountForSession, resolveAnthropicDispatchAccountId, bindAnthropicSessionAffinity,
     clearAnthropicSessionAffinityForAccount, rotateAnthropicAccountOn429, rotateAnthropicAccountOnRefusal,
     recordAnthropicAccount429, recordAnthropicAccountRefusal, promoteAnthropicActiveAccount,
-    commitAnthropicSelectionRouting, resetAnthropicRoutingForManualSelection, getAnthropicPoolAccessToken,
+    commitAnthropicSelectionRouting, resetAnthropicRoutingForManualSelection, flushAnthropicManualSelectionReset, resetAnthropicSessionAffinityConfirmed, flushAnthropicAccountPause, getAnthropicPoolAccessToken,
     getAnthropicPoolAccessSnapshot, canRefreshAnthropicPoolAccount,
   });
 }
@@ -1667,6 +1723,18 @@ export function commitAnthropicSelectionRouting(
 
 export function resetAnthropicRoutingForManualSelection(accountId: string): void {
   return anthropicRoutingFor("anthropic").resetAnthropicRoutingForManualSelection(accountId);
+}
+
+export function flushAnthropicManualSelectionReset(): Promise<boolean> {
+  return anthropicRoutingFor("anthropic").flushAnthropicManualSelectionReset();
+}
+
+export function resetAnthropicSessionAffinityConfirmed(): Promise<boolean> {
+  return anthropicRoutingFor("anthropic").resetAnthropicSessionAffinityConfirmed();
+}
+
+export function flushAnthropicAccountPause(): Promise<boolean> {
+  return anthropicRoutingFor("anthropic").flushAnthropicAccountPause();
 }
 
 export function getAnthropicPoolAccessToken(accountId: string): Promise<string> {

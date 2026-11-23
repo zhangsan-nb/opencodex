@@ -13,6 +13,11 @@ does not release a hosted hop while its runTurn producer is active; producer set
 unsent hop and clears only its matching pending reference. Standalone Images and direct callers
 retain their existing behavior.
 
+For a selected Claude CLI adapter, Responses request handling refuses instruction images and
+file-backed image references in messages, agent messages or tool results before vision preprocessing or helper
+dispatch. Other provider routes retain their own image handling; a usable image URL takes
+precedence over a file ID. `tests/providers/claude-cli-client-http.test.ts` covers this boundary.
+
 Mistral's registry entry in `src/providers/registry/entries-extended.ts` declares `zai-glm-5-3` native input as text-only, so registry enrichment enrolls that model in the enabled vision sidecar for existing configurations: the catalog advertises image attachments and request preprocessing sends GLM descriptions. Native Mistral vision models and explicit operator modalities retain precedence (`tests/vision/mistral-vision-sidecar.test.ts`).
 
 A registry entry can also declare `inputModalities` for the whole provider. It covers ids the per-model maps do not list, such as models from live discovery, and a per-model declaration still wins. AI Stupid Level declares text, so an image for one of its pinned models is described or stripped instead of being sent to the router (`tests/providers/aistupidlevel-provider.test.ts`).
@@ -31,6 +36,74 @@ Shared parsing and streaming follow the [request-copy](../transports/byte-accoun
 Fetch-based Anthropic model iterations use the [thinking-signature recovery contract](../transports/anthropic-thinking-recovery.md#imagevideo-model-iterations), without repeating completed media calls.
 
 Fetch-based Anthropic image bridge account recovery follows [the revoked-token contract](../providers/anthropic-account-pool.md#revoked-oauth-access-token-recovery), including output commitment and send-budget gates.
+
+The [provider timeout policy](../transports/timeouts.md#provider-scoped-budgets) covers the
+routed model iterations. Image and video generation use separate tool deadlines.
+
+## xAI image and video models
+
+The image bridge defaults to `grok-imagine-image-2.0`. For that model, OpenAI
+`low`/`standard` maps to xAI `low`, `medium`/`high`/`hd` to `medium`, and
+`auto` to `auto`; other models omit the quality field. Resolution mapping
+remains independent. Edits through `callXaiImages` and the `/v1/images/edits` relay accept up to five
+source URLs in caller order; both drop duplicate URLs first and then apply the limit, and the relay
+checks it before resolving credentials or sending a request. The relay refuses the request when any
+supplied source, an explicit `null` included, is not an https URL or a canonical base64 PNG/JPEG/WebP
+data URL (for example a `file_id` or plain text) instead of dropping it; every URL-bearing property of
+an `images[]` entry (`image_url`, `image_url.url`, `url`) counts as a source. The `image_gen` bridge tool sends one
+source. Safe upstream validation details are reconstructed from a
+closed vocabulary of quality, field, resolution and bounded keyframe tokens;
+unknown bodies and arbitrary upstream text never reach the caller.
+
+The video bridge defaults to `grok-imagine-video-1.5-lite`. The 1.5 model supports
+1080p, first and last frames, four keyframes and fourteen references capped at 720p;
+Lite supports 1080p and a first frame, while classic supports 720p, a first frame
+and seven references. Known models expose nine aspect ratios; unknown models retain
+the legacy seven ratios and no image inputs. `parseVideoCallArgs` refuses, before any paid
+call, every explicit setting the model cannot honour in the requested mode: an unsupported
+resolution, aspect ratio or duration; 1080p with `last_frame`, `keyframes` or references
+(reference-to-video stops at 720p); a keyframe outside the effective clip (8 s when no duration
+is given) or two keyframes in the same 1/3-second slot; classic `image` plus references, and classic
+references beyond 10 s; and an aspect ratio on plain image-to-video, which keeps the image's ratio.
+Image inputs accept HTTPS and bounded
+inline image data. A successful URL download records its original source URL in a
+256-entry, one-hour process-local map. Artifact references resolve by exact path or
+opaque ID without reading local files; they are forwarded only to the pinned xAI
+video destination. Inline image results have no source URL and cannot be referenced.
+
+## Video bridge destination
+
+`planVideoBridge` in `src/images/plan.ts` decides where `video_gen` submit and poll requests go and
+which key they carry. With `images.videoProvider` unset it keeps the historical xAI discovery and
+pins the destination to the registry `xai` base URL, so an `xai` row's `baseUrl` override never
+receives the key. `selectVideoProvider` resolves an explicit value: `xai` stays pinned, other
+registry ids are refused, and a custom row contributes only its own `baseUrl` and API key after the
+shared `providerDestinationConfigError` check (`allowPrivateNetwork` governs loopback and private
+hosts). That plan-time check sees only address literals, so it is repeated at connect time:
+`src/images/xai-video-client.ts` sends submit and poll through `providerOutboundPost` and
+`providerOutboundGet` with the selected row's name, `allowPrivateNetwork`, `proxy` and `noProxy`
+(carried on the plan's `VideoProviderAuth`). The outbound transport resolves the hostname, applies
+the opt-in to every answer and pins the connection to a validated address, so a hostname that
+resolves to loopback or private space never receives the key without the opt-in and a later DNS
+answer cannot move it. Cleartext `http` is admitted only for `localhost` or a local address literal
+on a row that sets `allowPrivateNetwork` itself; the poll GET passes `cleartextPolicy: "credentialed"`
+so it obeys exactly the submit POST's cleartext rules. The pinned xAI destination is sent as `xai` with no
+private-network opt-in, whatever the row carries, and only its registry `/videos/` URLs qualify for the
+fake-IP TUN exception. The base URL may not carry userinfo, a query or a fragment, because the client appends
+endpoint paths as strings, and a paused active key fails closed through `isProviderApiKeyPaused`.
+A keychain reference the selected row does not own (`keychainReferenceBelongsToProvider`) is refused
+for every destination, xAI included, before any secret is read. A recognizably xAI credential (an
+`xai-` key, a key held by any row named `xai` in any case or pointing at an xAI host, or an
+environment reference named for xAI or Grok) is refused unless the origin is HTTPS on an xAI host
+and the default port. The limit is recognition: an arbitrary literal with none of those marks cannot
+be attributed to xAI, which the guide tells operators.
+
+An explicit value that cannot be used produces an unavailable plan: the `video_gen` tool is still
+claimed, and `src/images/loop.ts` answers each call with the configuration error before any paid-call
+accounting or network request. It never falls back to xAI. The submit and poll requests never follow
+a redirect, keep the 1 MiB response cap, and the finished-video download keeps its public-HTTPS or
+`data:` policy.
+`tests/videos/video-provider.test.ts` covers both halves.
 
 ## Hosted Responses image display
 
@@ -109,7 +182,14 @@ distinct. A proxy admission bearer leaves managed Pool eligible: Pool replaces i
 credential, while Direct cannot forward it. A selected Pool authentication failure remains its own
 error rather than falling through to a separately billed keyed provider. The outbound Images send
 has one selected Authorization value, validated before the non-idempotent upstream POST.
-The keyed path never enters `handleResponses`, so `src/server/images.ts` repeats
+Images providers, including the default OpenAI API fallback, can recover a stale paused active key
+to an enabled pool entry inside the keyed branch. Audio and Live retain their strict snapshot
+selector; only Images opts in to deferred recovery. A fully paused pool never dispatches one of its
+keys. Implicit Images routing still tries eligible forward destinations and, for generations, CCA;
+if no alternative handles the request, the paused-pool error is 403 `permission_error`. An eligible
+alternative's own error retains its status, and an explicit custom provider remains fail-closed.
+The keyed path never
+enters `handleResponses`, so `src/server/images.ts` repeats
 `selectProactiveApiKeyTransport` inside the keyed branch and rebuilds Authorization from the
 returned clone rather than the earlier snapshot. Opt-in request-local round-robin uses that same selection seam and maps exhausted-key allocation to retryable 429. Genuine distributed 401/429 responses record the actual selected key cooldown, retaining Retry-After; synthetic replay refusals do not cool keys, and no paid POST is replayed. The standalone Images relay remains a single direct non-idempotent fetch outside the inference request-pacing executor; provider/key pacing limits do not cover that relay.
 
@@ -171,6 +251,9 @@ conflicts with `modelSupportsReasoningSummaries: false` for the same model.
 
 > Decision record: [ADR-0045](../decisions/ADR-0045-standalone-images.md)
 
+Media bridge worker legs follow the [credit accounting contract](../dashboard-and-usage.md#usage-accounting)
+when accumulating routed-model usage across iterations.
+
 Usage consumers preserve positive incomplete-history metadata as specified in [usage accounting](../dashboard-and-usage.md#usage-accounting); readable totals are not represented as a complete ledger. Upstream API-key usage follows the [physical-attempt account attribution contract](../dashboard-and-usage.md#upstream-key-account-attribution), independently of subscription quota observations.
 
 Connected CLI usage follows the [client-scoped hub usage contract](../dashboard-and-usage.md#usage-accounting); local management and account data remain separate.
@@ -201,7 +284,7 @@ Pool quota producers and account commands follow the [bounded raw-observation co
 
 Account quota surfaces use [safe probe diagnostics](../transports/inventory.md#account-quota-failure-diagnostics) separately from quota validity, credential health and routing authority.
 
-Combo child requests normalize effort and thinking controls against the selected target while retaining reasoning summaries; strict unknown targets preserve caller controls. The [Responses transport owner](../transports/responses.md) documents this boundary, and native Chat also honors explicit per-axis capability declarations; an initial JEV null choice separately strips caller effort.
+Combo child requests normalize effort and thinking controls against the selected target while retaining reasoning summaries; strict unknown targets preserve caller controls. The [Responses transport owner](../transports/responses.md) documents this boundary, and native Chat also honors explicit per-axis capability declarations; in the default `decide` mode an initial JEV null choice separately strips caller effort.
 
 Live sideband admission and its bounded upstream handshake follow the [runtime contract](../runtime.md#live-sideband-handshake); the ordinary Responses WebSocket exchange remains separate.
 

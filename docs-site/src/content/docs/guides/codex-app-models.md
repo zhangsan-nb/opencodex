@@ -399,13 +399,13 @@ The active declaration also controls the Ultra Fast choice when Codex loads its 
 
 For routed rows, `ultraFastTier` retains independently supplied Ultra Fast tiers from the
 same exact persisted row; generated routed tiers are not treated as operator-supplied.
-For bare native `gpt-6-astra` / `gpt-6.1-sol` rows and their trusted account-bound clones,
+For bare native `gpt-6-astra`, `gpt-6.1-sol`, `gpt-6.2-astra` and `gpt-6.2-sol` rows and their trusted account-bound clones,
 enabling `ultraFastTier` also generates a missing Ultrafast choice without changing the
 native default tier. Disabling it withdraws only native tier metadata tracked as generated;
 independently supplied or edited native tier descriptors are preserved.
 
-[OpenAI's API guide](https://developers.openai.com/api/docs/guides/ultrafast-mode) documents
-Ultrafast for GPT-6 Astra and GPT-6.1 Sol. API access and
+[OpenAI's speed guide](https://learn.chatgpt.com/docs/agent-configuration/speed#ultrafast-mode) documents
+Ultrafast for GPT-6.2 Astra and Sol alongside GPT-6 Astra and GPT-6.1 Sol. API access and
 [Codex plan/workspace access](https://learn.chatgpt.com/docs/agent-configuration/speed)
 are separate. A menu choice does not grant provider access or guarantee measured speed;
 Ultra Fast increases usage/cost, and Codex's own feature requirements still apply.
@@ -415,8 +415,8 @@ Ultra Fast increases usage/cost, and Codex's own feature requirements still appl
 Codex sorts picker-visible catalog entries by ascending `priority` and advertises the first five as
 `spawn_agent` model overrides. The dashboard Subagents page can select and save up to five bare
 native ids or routed `provider/model` ids. Manually configured `subagentModels` also accepts
-account-qualified `<selector>/<native-openai-model>` ids, but the dashboard does not offer those
-exact ids; saving the page replaces the list with dashboard-visible choices. opencodex assigns low
+account-qualified `<selector>/<native-openai-model>` ids. The dashboard retains these exact saved
+ids, including models missing from the current catalog, when saving the roster. opencodex assigns low
 catalog priorities in the selected order; when account-qualified picker rows are enabled, bare native selections
 expand into selector-qualified groups. Other models remain callable by exact id.
 

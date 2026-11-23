@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type KeyboardEvent } from "react";
+import { Fragment, useEffect, useRef, useState, type KeyboardEvent } from "react";
 import { navigateHash } from "../hash-routing";
 import { canonicalHashPath } from "../app-routing";
 import { useT } from "../i18n/shared";
@@ -9,6 +9,7 @@ import Claude from "./Claude";
 import ClaudeDesktop from "./ClaudeDesktop";
 import Grok from "./Grok";
 import CursorIntegrationPage from "./integrations/CursorIntegrationPage";
+import GatewayClientsPage from "./integrations/GatewayClientsPage";
 import IntegrationsOverview from "./integrations/IntegrationsOverview";
 import AsideProfilesPage from "./integrations/AsideProfilesPage";
 import HermesProfilesPage from "./integrations/HermesProfilesPage";
@@ -139,7 +140,7 @@ export default function Integrations({ apiBase, machineApiBase = apiBase, connec
       <div className="page-head">
         <h2>{t("nav.connect")}</h2>
       </div>
-      <p className="page-sub">{t("integrations.subtitle")}</p>
+      <p className="page-sub">{t("connectV2.subtitle")}</p>
       {connected && (
         <section className="notice" aria-label={t("connection.clients.title")}>
           <strong>{t("connection.clients.title")}</strong>
@@ -148,10 +149,10 @@ export default function Integrations({ apiBase, machineApiBase = apiBase, connec
         </section>
       )}
 
-      <div className="page-tabs" role="tablist" aria-label={t("integrations.tabsLabel")}>
+      <div className="page-tabs connect-tabs" role="tablist" aria-label={t("integrations.tabsLabel")}>
         {TABS.map(definition => (
+          <Fragment key={definition.id}>
           <button
-            key={definition.id}
             ref={node => {
               if (node) tabRefs.current!.set(definition.id, node);
               else tabRefs.current!.delete(definition.id);
@@ -171,6 +172,9 @@ export default function Integrations({ apiBase, machineApiBase = apiBase, connec
             )}
             {t(definition.labelKey)}
           </button>
+          {/* The two page-level tabs come first; a hairline sets them apart from the apps. */}
+          {definition.id === "keys" && <span className="connect-tabs-divider" role="presentation" />}
+          </Fragment>
         ))}
       </div>
 
@@ -211,6 +215,7 @@ export default function Integrations({ apiBase, machineApiBase = apiBase, connec
               </div>
             )}
             {definition.id === "cursor" && <CursorIntegrationPage apiBase={apiBase} active={active} />}
+            {definition.id === "antigravity" && <GatewayClientsPage apiBase={apiBase} active={active} />}
             {FILE_CLIENTS.has(definition.id as FileIntegrationClientId) && (
               definition.id === "aside" ? <AsideProfilesPage apiBase={apiBase} active={active} />
               : definition.id === "hermes" ? <HermesProfilesPage apiBase={apiBase} active={active} /> : <FileIntegrationPage

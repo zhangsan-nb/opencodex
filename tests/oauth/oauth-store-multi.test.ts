@@ -213,27 +213,65 @@ describe("multi-account auth store", () => {
     }
   });
 
-  test.each(["false", "throw"] as const)("recovery survives registration %s and warns without exposing credentials", async (failure) => {
+  // The backup is registered before it is created. An unowned home still gets the recovery copy; a
+  // full owned manifest gets none, because an unlisted credential copy would survive uninstall; a
+  // thrown refusal defers the migration so a retry backs up again.
+  test.each(["unowned", "full", "throw"] as const)("recovery handles registration %s and warns without exposing credentials", async (failure) => {
     const path = join(TEST_DIR, "auth.json");
     const backup = `${path}.pre-multiauth`;
     const original = JSON.stringify({ xai: cred({ email: "old@example.test" }) });
     writeFileSync(path, original);
-    const register = configOwnership.recordOwnedConfigPath;
-    const registration = spyOn(configOwnership, "recordOwnedConfigPath").mockImplementation((dir, candidate) => {
+    const register = configOwnership.registerOwnedConfigPath;
+    const registration = spyOn(configOwnership, "registerOwnedConfigPath").mockImplementation((dir, candidate) => {
       if (candidate !== backup) return register(dir, candidate);
       if (failure === "throw") throw new Error("private ownership failure fixture");
-      return false;
+      return failure;
     });
     const warning = spyOn(console, "warn").mockImplementation(() => {});
     try {
-      await saveCredential("xai", cred({ email: "old@example.test", access: "new-access" }));
+      const saved = saveCredential("xai", cred({ email: "old@example.test", access: "new-access" }));
+      if (failure === "unowned") {
+        await saved;
+        expect(readFileSync(backup, "utf8")).toBe(original);
+        expect(getCredential("xai")?.access).toBe("new-access");
+        expect(warning.mock.calls).toEqual([["[oauth] Recovery backup created, but uninstall ownership registration failed."]]);
+      } else if (failure === "full") {
+        await saved;
+        expect(existsSync(backup)).toBe(false);
+        expect(getCredential("xai")?.access).toBe("new-access");
+        expect(warning.mock.calls).toEqual([["[oauth] Recovery backup skipped: the uninstall ownership manifest is full."]]);
+      } else {
+        // The migration is deferred: no unlisted copy, and the legacy store is left for a retry.
+        await expect(saved).rejects.toThrow("OAuth store migration deferred");
+        expect(existsSync(backup)).toBe(false);
+        expect(readFileSync(path, "utf8")).toBe(original);
+        expect(warning.mock.calls).toEqual([]);
+      }
       expect(registration).toHaveBeenCalledWith(TEST_DIR, backup);
-      expect(readFileSync(backup, "utf8")).toBe(original);
-      expect(getCredential("xai")?.access).toBe("new-access");
-      expect(warning.mock.calls).toEqual([["[oauth] Recovery backup created, but uninstall ownership registration failed."]]);
     } finally {
       warning.mockRestore();
       registration.mockRestore();
+    }
+  });
+
+  test("a full manifest in an owned home leaves no credential backup behind uninstall", async () => {
+    const dir = join(TEST_DIR, "full");
+    const path = join(dir, "auth.json");
+    process.env.OPENCODEX_HOME = dir;
+    const warning = spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      expect(recordOwnedConfigPath(dir, path)).toBe(true);
+      writeFileSync(path, JSON.stringify({ xai: cred({ email: "old@example.test" }) }));
+      // Fill the manifest with short names until even the backup's name no longer fits.
+      for (let i = 0; i < 2_000; i += 1) if (!recordOwnedConfigPath(dir, join(dir, "f" + i))) break;
+      await saveCredential("xai", cred({ email: "old@example.test", access: "new-access" }));
+      expect(existsSync(`${path}.pre-multiauth`)).toBe(false);
+      expect(getCredential("xai")?.access).toBe("new-access");
+      await flushConfigDirHardeningForTests();
+      expect(removeOwnedConfigState(dir).status).toBe("removed");
+    } finally {
+      warning.mockRestore();
+      process.env.OPENCODEX_HOME = TEST_DIR;
     }
   });
 
@@ -452,7 +490,7 @@ describe("multi-account auth store", () => {
 
   test("new identity appends a second account and activates it", async () => {
     await saveCredential("anthropic", cred({ email: "a@example.com", accountId: "acct-a" }));
-    await saveCredential("anthropic", cred({ email: "b@example.com", accountId: "acct-b", access: "access-b" }));
+    await saveCredential("anthropic", cred({ email: "b@example.com", accountId: "acct-b", access: "access-b", refresh: "refresh-b" }));
     expect(listAccounts("anthropic").length).toBe(2);
     expect(getCredential("anthropic")?.email).toBe("b@example.com");
   });
@@ -586,7 +624,7 @@ describe("multi-account auth store", () => {
 
   test("setActiveAccount switches what getCredential returns", async () => {
     await saveCredential("anthropic", cred({ email: "a@example.com", accountId: "acct-a", access: "access-a" }));
-    await saveCredential("anthropic", cred({ email: "b@example.com", accountId: "acct-b", access: "access-b" }));
+    await saveCredential("anthropic", cred({ email: "b@example.com", accountId: "acct-b", access: "access-b", refresh: "refresh-b" }));
     const set = getAccountSet("anthropic")!;
     const idA = set.accounts.find(a => a.credential.email === "a@example.com")!.id;
     expect(await setActiveAccount("anthropic", idA)).toBe(true);
@@ -602,6 +640,29 @@ describe("multi-account auth store", () => {
     expect(getAccountSet("anthropic")!.activeAccountId).toBe(id);
     expect(await setAccountAlias("anthropic", id, undefined)).toBe(true);
     expect(listAccounts("anthropic")[0]?.alias).toBeUndefined();
+  });
+
+  test("Anthropic auth store advances the persisted credential revision for login, rotation, and import", async () => {
+    const original = cred({ accountId: "synthetic-anthropic-revision" });
+    await saveCredential("anthropic", original);
+    const id = getAccountSet("anthropic")!.activeAccountId;
+    const readRevision = () => listAccounts("anthropic").find(account => account.id === id)!.credentialRevision!;
+    const first = readRevision();
+    expect(first.sequence).toBe(1);
+    await setAccountAlias("anthropic", id, "Renamed seat");
+    expect(readRevision()).toEqual(first);
+    await mergeAccountCredential("anthropic", id, original);
+    expect(readRevision()).toEqual(first);
+    await mergeAccountCredential("anthropic", id, { ...original, refresh: "synthetic-rotated-refresh" });
+    const rotated = readRevision();
+    expect(rotated.sequence).toBe(first.sequence + 1);
+    expect(rotated.id).not.toBe(first.id);
+    expect(await upsertCredentialByIdentity("anthropic", original)).toBe("updated");
+    const imported = readRevision();
+    expect(imported.sequence).toBe(rotated.sequence + 1);
+    expect(imported.id).not.toBe(first.id);
+    await saveAccountCredential("anthropic", id, original, { rotateLoginId: true });
+    expect(readRevision().sequence).toBe(imported.sequence + 1);
   });
 
   test("saveAccountCredential persists refresh for a non-active account without switching active", async () => {
@@ -658,7 +719,7 @@ describe("multi-account auth store", () => {
 
   test("removeCredential removes only the active account", async () => {
     await saveCredential("anthropic", cred({ email: "a@example.com", accountId: "acct-a", access: "access-a" }));
-    await saveCredential("anthropic", cred({ email: "b@example.com", accountId: "acct-b", access: "access-b" }));
+    await saveCredential("anthropic", cred({ email: "b@example.com", accountId: "acct-b", access: "access-b", refresh: "refresh-b" }));
     await removeCredential("anthropic"); // active is b
     expect(listAccounts("anthropic").length).toBe(1);
     expect(getCredential("anthropic")?.access).toBe("access-a");

@@ -1,5 +1,6 @@
 import { inheritAccountAutoPauseResponse } from "../lib/account-auto-pause-response";
 import { readBoundedResponseBody } from "../lib/bounded-body";
+import { providerErrorTypeOf, withProviderFailureFacts } from "../lib/failure-detail";
 import { redactSecretString } from "../lib/redact";
 
 const ABSOLUTE_PATH_PATTERN = /(?:\/Users\/[^ "';,]+|\/home\/[^ "';,]+|\/root\/[^ "';,]*|[A-Za-z]:\\Users\\[^ "';,]+)/g;
@@ -32,6 +33,23 @@ export async function readDisplaySafeErrorPayloadText(res: Response, signal?: Ab
   }
 }
 
+const rewrittenUpstreamErrors = new WeakSet<Response>();
+
+/**
+ * Whether an adapter replaced this provider failure's body with display text. The provider's own
+ * codes, and the fact that a body was unreadable or oversized, are gone from such a response, so
+ * combo failover must not read it as the provider's evidence (#9017).
+ */
+export function isRewrittenUpstreamError(response: Response): boolean {
+  return rewrittenUpstreamErrors.has(response);
+}
+
+/** Record a replacement response whose body no longer holds the provider's complete failure body. */
+export function markRewrittenUpstreamError<T extends Response>(response: T): T {
+  rewrittenUpstreamErrors.add(response);
+  return response;
+}
+
 export async function normalizeUpstreamHttpErrorResponse(
   res: Response,
   opts: { signal?: AbortSignal; formatMessage: (payloadText: string) => string | Promise<string> },
@@ -41,9 +59,12 @@ export async function normalizeUpstreamHttpErrorResponse(
   const headers = new Headers(res.headers);
   headers.delete("content-encoding");
   headers.delete("content-length");
-  return inheritAccountAutoPauseResponse(res, new Response(await opts.formatMessage(payloadText), {
+  // The rewritten body is display text; keep the provider's closed error class for the request log (#8446).
+  const rewritten = withProviderFailureFacts(inheritAccountAutoPauseResponse(res, new Response(await opts.formatMessage(payloadText), {
     status: res.status,
     statusText: res.statusText,
     headers,
-  }));
+  })), { type: providerErrorTypeOf(parseUpstreamJsonPayload(payloadText)) });
+  rewrittenUpstreamErrors.add(rewritten);
+  return rewritten;
 }

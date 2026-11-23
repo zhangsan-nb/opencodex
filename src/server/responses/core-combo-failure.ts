@@ -1,4 +1,19 @@
-import { codexAccountModelRefusal, codexAccountModelRefusalHardStopCode, type CodexAccountModelRefusal } from "../../combos/failover";
+import { recordUpstreamProviderErrorDetail, recordUpstreamValidationDetail, type FailureDetail } from "../request-log-failure-detail";
+import { carryProxyErrorPresentation } from "../../lib/client-error-body";
+import { carryPolicyCandidateRefusal } from "./policy-request-scope";
+import { comboFailureEvidence, carryProxyError } from "../../lib/client-error-body";
+import { carryWorkflowRefusal } from "../workflow-refusal";
+import {
+  codexAccountModelRefusal,
+  codexAccountModelRefusalHardStopCode,
+  isMalformedResponseFormatRequest,
+  isOpenRouterOpaque400Envelope,
+  isUnofferedToolCallRefusal,
+  isProviderModerationRefusal,
+  isProviderIntakeRefusalBody,
+  upstreamEnvelopeRootCode,
+  type CodexAccountModelRefusal,
+} from "../../combos/failover";
 import { parseRetryAfterMs } from "../../combos";
 import type { ConsumedComboFailure, HandleResponsesOptions } from "./core-options";
 import type { OcxUsage } from "../../types";
@@ -25,6 +40,10 @@ import { carryReplayRefusal, isNonReplayableResponse, isReplayRefusalResponse, m
 import { MODEL_NOT_ALLOWED_FOR_KEY } from "../admission-model-scope";
 import { usageFromResponsesPayload } from "../request-log";
 import type { ResponsesTerminalStatus } from "../../bridge";
+import { isXaiLegacyPrivacyError, isXaiPrivacyModeRefusal, xaiPrivacyModeRefusal, XAI_LEGACY_PRIVACY_MESSAGE } from "../../providers/xai-privacy-mode";
+import { stampMetaMusePlanRefusal } from "../../providers/meta-muse-plan-refusal";
+import type { RequestFailureCause } from "../../usage/telemetry-contract";
+import { isRewrittenUpstreamError } from "../../adapters/upstream-http-error";
 
 export function sanitizedRetryAfter(value: string | null, now: number): string | undefined {
   const trimmed = value?.trim();
@@ -35,10 +54,25 @@ export function sanitizedRetryAfter(value: string | null, now: number): string |
 
 
 
+/** A failure envelope this proxy formatted from a provider body it already consumed. */
+function isProxyFormattedFailure(text: string): boolean {
+  try {
+    const parsed: unknown = JSON.parse(text);
+    const error = parsed && typeof parsed === "object" && !Array.isArray(parsed) ? (parsed as { error?: unknown }).error : undefined;
+    const message = error && typeof error === "object" && !Array.isArray(error) ? (error as { message?: unknown }).message : undefined;
+    return typeof message === "string" && /^Provider error \d{3}\b/.test(message);
+  } catch {
+    return false;
+  }
+}
 export async function consumeComboFailure(
   response: Response,
   signal?: AbortSignal,
   now = Date.now(),
+  logCtx?: { failureDetail?: FailureDetail; causeHint?: RequestFailureCause },
+  /** True only when `response` is the provider's own HTTP answer, so its closed error class is evidence. */
+  rawUpstream = false,
+  grokOAuth = false,
 ): Promise<ConsumedComboFailure> {
   // Read before the body: the marker lives on this Response object, and the failure below is
   // rebuilt as a new one that would otherwise lose it.
@@ -47,8 +81,16 @@ export async function consumeComboFailure(
   const fallback = `Provider error ${response.status}`;
   let classificationText = fallback;
   let codexModelRefusal: CodexAccountModelRefusal | undefined;
+  let malformedResponseFormat: boolean | undefined;
+  let openRouterOpaque400: boolean | undefined;
+  let unofferedToolCallRefusal: boolean | undefined;
+  let providerModerationRefusal: boolean | undefined;
+  // A 413 may hop only once its complete body was read and judged; an oversized, unreadable or
+  // aborted body leaves the evidence unknown, and unknown evidence keeps dev's terminal 413.
+  let providerIntakeRefusal: boolean | undefined = response.status === 413 ? false : undefined;
   let usage: OcxUsage | undefined;
   let upstreamCode: string | undefined;
+  let upstreamRootCode: string | undefined;
   let upstreamMessage: string | undefined;
   let upstreamType: string | undefined;
   // Whether the body itself confirms a quota/rate-limit refusal, computed on the SAME read as
@@ -62,7 +104,9 @@ export async function consumeComboFailure(
   let scopeRefusalBody: string | undefined;
   let verifiedPlanRefusal = false;
   try {
-    const body = await readBoundedResponseBody(response, { signal, reportUtf8Validity: serverError });
+    const legacy = comboFailureEvidence(response);
+    if (legacy !== undefined) void response.body?.cancel().catch(() => undefined);
+    const body = await readBoundedResponseBody(legacy === undefined ? response : new Response(legacy), { signal, reportUtf8Validity: serverError });
     // A 5xx body counts as quota or classification evidence only when it decoded as valid
     // UTF-8, matching shouldRetryCodexPoolAccountQuota. A malformed byte keeps the status-only
     // fallback, with one exception: a cyber-policy refusal must still stop the combo, so the
@@ -75,7 +119,50 @@ export async function consumeComboFailure(
         && isRateLimitOrQuotaFailureMessage(quotaMessage);
     }
     if (body.displaySafe && !body.truncated) {
-      if (response.status === 400) codexModelRefusal = codexAccountModelRefusal(response.status, body.text);
+      if (isXaiPrivacyModeRefusal(response) || (grokOAuth && isXaiLegacyPrivacyError(response.status, body.text))) {
+        const refusal = xaiPrivacyModeRefusal(logCtx);
+        if (response.headers.get("x-should-retry") === "false") refusal.headers.set("x-should-retry", "false");
+        if (nonReplayable) markResponseNonReplayable(refusal);
+        return {
+          response: refusal,
+          ...(nonReplayable ? { nonReplayable: true } : {}),
+          classificationText: XAI_LEGACY_PRIVACY_MESSAGE,
+          upstreamMessage: XAI_LEGACY_PRIVACY_MESSAGE,
+          upstreamType: "permission_error",
+          upstreamCode: "permission_denied",
+        };
+      }
+      if (logCtx && rawUpstream) recordUpstreamProviderErrorDetail(logCtx, response.status, body.text, response);
+      else if (logCtx) recordUpstreamValidationDetail(logCtx, response.status, body.text);
+      // A combo child's row is attributed from the same evidence the parent uses: Meta's Muse
+      // Code refusal is a plan restriction, not a rejected credential (#8352).
+      if (logCtx) stampMetaMusePlanRefusal(logCtx, response.status, body.text);
+      if (response.status === 400) {
+        codexModelRefusal = codexAccountModelRefusal(response.status, body.text);
+        malformedResponseFormat = isMalformedResponseFormatRequest(response.status, body.text);
+        openRouterOpaque400 = isOpenRouterOpaque400Envelope(body.text);
+        // The intact bounded body, not the 500-char display prefix: a long refusal envelope
+        // would fail the classifier's JSON parse on truncated text and stop the combo.
+        unofferedToolCallRefusal = isUnofferedToolCallRefusal(response.status, body.text);
+      }
+      // Judged on the whole body: the classification text below is cut at 500 characters, and a
+      // hard refusal after the cut must still veto a moderation hop.
+      if (response.status === 400 || response.status === 422) {
+        providerModerationRefusal = isProviderModerationRefusal(response.status, body.text, undefined, true);
+      }
+      // The same whole-body rule for the provider-413 hop (#9017): a hard refusal or proxy marker
+      // past the 500-character cut must still keep the combo from sending the turn elsewhere.
+      // A native lane's rewritten envelope (Messages or Chat native) is not the provider's body: its
+      // terminal codes and an oversized original are gone, so only the original read may clear it.
+      // So is a sidecar loop's (web search, image bridge) envelope, whose message is the proxy's own
+      // "Provider error 413" summary of a body it already read.
+      if (response.status === 413) {
+        providerIntakeRefusal = legacy === undefined && !isRewrittenUpstreamError(response) && !isProxyFormattedFailure(body.text)
+          && isProviderIntakeRefusalBody(body.text);
+      }
+      // Status-independent: the nested record is what normalization selects, so a root verdict
+      // beside it has to be captured here or the conflict rule never sees it.
+      upstreamRootCode = upstreamEnvelopeRootCode(body.text);
       const normalized = normalizeUpstreamErrorText(body.text, fallback);
       if (utf8Trusted || isCyberPolicyCode(normalized.code) || isCyberPolicyMessage(normalized.safeText)) {
         classificationText = normalized.safeText;
@@ -139,7 +226,11 @@ export async function consumeComboFailure(
     },
   );
   if (nonReplayable) markResponseNonReplayable(failureResponse);
+  carryProxyError(response, failureResponse);
+  carryWorkflowRefusal(response, failureResponse);
   carryReplayRefusal(response, failureResponse);
+  carryProxyErrorPresentation(response, failureResponse);
+  carryPolicyCandidateRefusal(response, failureResponse);
   if (verifiedPlanRefusal) markVerifiedModelNotInPlanResponse(failureResponse);
   carryAnthropicRefusalCredential(response, failureResponse);
   carryCodexAccountCooldownResponse(response, failureResponse);
@@ -149,7 +240,15 @@ export async function consumeComboFailure(
     ...(verifiedPlanRefusal ? { verifiedPlanRefusal: true } : {}),
     classificationText,
     ...(codexModelRefusal !== undefined ? { codexModelRefusal } : {}),
+    ...(malformedResponseFormat !== undefined ? { malformedResponseFormat } : {}),
+    ...(openRouterOpaque400 !== undefined ? { openRouterOpaque400 } : {}),
+    ...(unofferedToolCallRefusal !== undefined ? { unofferedToolCallRefusal } : {}),
+    ...(providerModerationRefusal !== undefined ? { providerModerationRefusal } : {}),
+    ...(providerIntakeRefusal !== undefined ? { providerIntakeRefusal } : {}),
     ...(normalizedUpstreamCode !== undefined ? { upstreamCode: normalizedUpstreamCode } : {}),
+    // A rewritten identity (policy, replay refusal) is the whole verdict; the root's own code
+    // would only re-open a decision that rewrite already settled.
+    ...(!cyberFailure && !replayRefusal && upstreamRootCode !== undefined ? { upstreamRootCode } : {}),
     ...(upstreamMessage !== undefined ? { upstreamMessage } : {}),
     ...(upstreamType !== undefined ? { upstreamType } : {}),
     ...(!cyberFailure && cooldownRetryAfter !== undefined ? { retryAfter: cooldownRetryAfter } : {}),

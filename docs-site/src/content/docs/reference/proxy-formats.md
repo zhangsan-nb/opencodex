@@ -20,6 +20,16 @@ response safety still happen at the proxy boundary. Configure the listener and a
 [Configuration](/reference/configuration/); use [Combos](/guides/combos/) when one public model id
 should select among several targets.
 
+## Function tool strictness on Chat input
+
+When Chat Completions is translated to OpenAI's Responses API or the ChatGPT backend,
+function tools keep Chat's non-strict
+default: an omitted `strict` is sent as `false`. Explicit `true` and `false` are preserved;
+legacy `functions` also stay non-strict. Optional arguments remain optional, including
+Computer Use's alternative element-index and coordinate selectors. This does not rewrite
+the caller's parameter schema or change the defaults for native Responses requests,
+Chat destinations, or third-party Responses providers.
+
 ## Required tools on buffered native combo routes
 
 A combo checks buffered native `openai-responses` JSON results when `tool_choice` is `required`
@@ -46,9 +56,26 @@ preserving any pending upstream read. Text, tool events, unknown/opaque output a
 commit the current target. Namespace selectors and call echoes share the authorized alias restoration.
 After that boundary, missing calls produce `response.failed` without another target request; already delivered
 output and usage remain intact. Hosted execution evidence also prevents replay, even when the final
-snapshot omits it. Auto/none, incomplete results and unknown contracts retain their existing rules.
+snapshot omits it. If a `response.completed` event or its nested response carries a non-empty
+`error` or `last_error` verdict, the combo keeps that target. Streaming clients receive the
+provider's terminal event. Buffered clients receive a JSON error with the mapped HTTP status.
+OpenCodex records the failure and any reported usage without saving the response for
+`previous_response_id` replay.
+Auto/none, incomplete results and unknown contracts retain their existing rules.
 
 ## Required tools on translated Chat routes
+
+Before sending, the proxy rejects a mandatory tool choice that the selected Chat destination cannot
+represent, such as `computer_use` or a required allowed-tool list containing MCP selections. A direct
+route returns HTTP 400 without an upstream request. A routing profile can continue to another
+originally eligible destination under its configured fallback policy, preserving the original choice.
+An explicit nonempty catalog with `required` is also refused when no tool survives in the full parsed Chat catalog, including tools supplied through input items. A surviving client tool keeps a mixed catalog eligible; hosted web search retains its later sidecar handling.
+If no eligible target remains and all attempted candidates were locally incompatible, the profile returns the same HTTP 400 diagnostic;
+the Responses API returns HTTP 503 for an exhausted combo, naming the mandatory-tool constraint. Other failures
+retain their existing error handling. Copilot Auto uses the final negotiated model and wire for this check.
+A local incompatibility before inference does not count as a model send, including after a session refresh.
+Negotiating a replacement account or model does not rewrite the attribution of an earlier physical send.
+If a send-budget limit stops traversal first, the proxy retains the preceding failure instead of blaming tool compatibility.
 
 A translated OpenAI Chat response must contain a complete selected client tool call when
 `tool_choice` is required, names a tool, or uses a required allowed-tool selection. If the upstream
@@ -183,6 +210,8 @@ to the bare tool name the request declared (`default.Read` → `Read`).
 | Streaming dictation | `WS /v1/audio/transcriptions/stream` | Not applicable | Desktop dictation JSON events |
 | Voice and Realtime | `POST /v1/live`, `POST /v1/realtime/calls` | Relayed call-creation response | A separate sideband WebSocket relays frames in both directions |
 | Responses compaction | `POST /v1/responses/compact` | Replacement-history JSON | Not applicable |
+| Gemini API | `POST /v1beta/models/{model}:generateContent` | Gemini response JSON | `:streamGenerateContent` SSE with `alt=sse`, otherwise one JSON array |
+| Gemini Interactions | `POST /v1beta/interactions` | `interaction` JSON | Interactions SSE events |
 
 ## File transcription
 
@@ -256,13 +285,44 @@ Use the actual sample rate of mono PCM16 audio. Wait for `session.started`, then
 send `{"type":"audio.append","audio":"<base64 PCM bytes>"}`. These are JSON text
 frames, not WAV files or binary WebSocket frames. The gateway accepts sample
 rates from 8,000 through 192,000 Hz; upstream support is account/service-dependent.
-Client frames are limited to 64 KiB and sessions to five minutes. Unsupported or
+Client frames are limited to 64 KiB. The proxy allows up to ten minutes
+(600,000 ms) for recording from relay attachment. A valid `session.close` before
+that deadline replaces the recording timer with a separate, bounded 60-second
+window for final transcripts. Keep the WebSocket open during finalization.
+`config.session_ttl_ms` accepts 1–600,000 and is forwarded unchanged; it does not
+set the proxy's recording timer (existing clients may still send 300,000).
+These are OpenCodex application budgets, not demonstrated official OpenAI limits.
+GPT Live and other audio transports retain their existing lifetimes. Unsupported or
 malformed event/config fields close the stream with code 1008.
 
 `transcript.segment` and `transcript.final` contain `utterance_id`, `revision`, and
 `text`. Replace prior text for the same utterance when its revision increases;
 do not concatenate revisions. Finish with `{"type":"session.close"}` and wait
 for final text and `session.updated` with `session.status="closed"`.
+
+The ScribeTray streaming client uses this additional supported start shape
+(replace the example UUIDs with client-generated identifiers):
+
+```json
+{"type":"session.start","dictation_session_id":"78d201cb-1b49-40e1-a5b5-e06a8f8489a1","attempt_id":"8b3c2e4f-d501-4a66-b123-456789abcdef","config":{"input_audio_format":"pcm16","sample_rate_hz":16000,"num_channels":1,"max_buffer_size_bytes":4194304,"max_utterance_duration_ms":30000,"session_ttl_ms":300000,"provider_mode":"streaming_sse","transcript_delivery_mode":"final_only","session_asset_mode":"none","vad":{"type":"server_vad"}},"client_capabilities":["server_stop_requested"]}
+```
+
+The identifiers are optional, nonblank strings of at most 128 UTF-8 bytes.
+`client_capabilities` is optional and accepts an empty array or just
+`"server_stop_requested"`. Optional `config.language` is a nonblank string of at
+most 64 UTF-8 bytes (for example `"it"`); these strings cannot contain control
+characters. Optional `config.session_asset_mode` accepts only `"none"`.
+VAD needs only `{"type":"server_vad"}`. If supplied, `threshold` must be finite
+and within 0–1, `prefix_padding_ms` an integer within 0–1,000, and
+`silence_duration_ms` an integer within 0–5,000.
+
+After start, `{"type":"audio.flush"}` is also accepted and forwarded unchanged.
+It does not close the session; more audio may follow until `session.close`.
+ScribeTray finishes by sending `audio.flush`, then `session.close`, then waiting
+for final results. This supports that client's sequence without asserting that
+flush is required instead of close alone. No audio or other client events are
+accepted after `session.close`. The earlier start and close-only payloads remain
+supported. Unknown fields and unsupported capability values remain rejected.
 
 ## `POST /v1/responses`
 
@@ -368,8 +428,8 @@ completion event for that open call. Calls already completed keep their status. 
 the provider outcome.
 
 On the Responses streaming wire, an explicit non-retryable content-filter stop from
-Anthropic (`refusal` / `content_filter`) or Kiro (`CONTENT_FILTERED` /
-`GUARDRAIL_INTERVENED`) ends with `response.failed`, `error.code: "invalid_prompt"`,
+Anthropic (`refusal` / `content_filter`), Kiro (`CONTENT_FILTERED` /
+`GUARDRAIL_INTERVENED`) or Antigravity ACP (`refusal`) ends with `response.failed`, `error.code: "invalid_prompt"`,
 and `retryable: false`. This prevents clients that retry incomplete streams from
 resending the refused context. Usage and partial output are preserved. Web-search
 and image sidecars stop without executing calls from that refused iteration or
@@ -383,8 +443,10 @@ and EOFs keep their existing incomplete behavior.
 Explicit incomplete reasons use the same vocabulary in adapter-backed responses and native
 Responses JSON, SSE, and WebSocket delivery:
 output-limit aliases such as `length` and `max_tokens` become `max_output_tokens`, and refusal/filter
-aliases such as `refusal` become `content_filter`. Other reasons remain unchanged, along with the
-provider's message, retryability, and usage. Direct Chat and Messages encoders apply the same mapping.
+aliases such as `refusal` become `content_filter`. Other reasons remain unchanged, along with
+retryability and usage. Responses and Messages output keep the provider's message; Chat Completions
+failures use a proxy-written message instead. Direct Chat and Messages encoders apply the same
+reason mapping.
 
 On the pending `dev` implementation for #4112, a final upstream HTTP 413 on this surface
 is classified as `invalid_request_error` / `context_length_exceeded`. Non-streaming callers
@@ -403,6 +465,13 @@ If native passthrough rewriting fails, including when it exceeds the translation
 buffer budget, the relay reports the failure without waiting for upstream inspection
 to finish. It cancels the upstream work and emits `response.failed` followed by
 `data: [DONE]`; a budget overflow uses the `translation_buffer_limit` error code.
+
+When filtering replayed tool results, Cursor, xAI Responses and Qoder hold lines that might be
+echoed tool envelopes until they can distinguish them from prose. An unresolved line is limited
+to 65,536 UTF-16 code units, including trailing whitespace. Exceeding this limit ends the turn
+without publishing the held text or a successful completion. Cursor and xAI report
+`translation_buffer_limit`; Qoder reports its existing non-retryable `vendor_scaffold_detected`
+refusal. Ordinary prose and closed fenced examples within the limit remain intact.
 
 Responses SSE accepts CR, LF and CRLF line endings, including mixed endings and CRLF split across
 network chunks. Tool validation, Chat translation, terminal inspection and WebSocket projection
@@ -473,6 +542,25 @@ When available, `input_tokens_details` can also include `cache_write_tokens`. Th
 detail objects are a compatibility guarantee for strict Responses clients; zero can mean "not
 reported," not necessarily "the provider performed no such work."
 
+When the terminal continuation guard re-asks within a turn, a successful completion that reports
+usage shows the final leg's usage for that re-ask. In Chat Completions, this includes
+`prompt_tokens`, which reflects the context sent on the final leg. A hosted-search Chat re-ask
+follows the same rule. When an empty-completion retry re-asks, the reported usage also includes the
+discarded empty attempt. A response that ends incomplete or failed shows the usage summed across
+the legs, and so does a final leg that reports no usage of its own. An incomplete response includes
+one stopped at the output token limit. The request log includes reported usage from every leg once,
+and the send budget counts every leg. The spend ledger settles each leg's send with the usage that
+leg reported. A send that reported no usage stays unresolved at its reservation. If OAuth recovery
+switches accounts, each attempt records the usage reported by its own account. If a leg reports no
+usage, that attempt's provider credit total is marked incomplete. A provider retry sent while a
+response is still being read, such as Kiro's completion retry, settles with the usage its own
+response reported, and the first send keeps its own reading. A retry whose response reports no
+token usage of its own stays unresolved at its reservation, even when the client and the request
+log show a local estimate for it. A streamed Chat Completions turn that fails
+ends in an error frame instead of a finish chunk. If the client set
+`stream_options.include_usage`, a chunk with empty `choices` carrying the failed turn's usage comes
+right before that error frame. A non-streaming Chat error body has no usage field.
+
 For Anthropic upstreams, a reported `usage.output_tokens_details.thinking_tokens` is preserved as
 Responses `output_tokens_details.reasoning_tokens` and Chat `completion_tokens_details.reasoning_tokens`,
 for JSON and streaming replies. It is already included in the output-token total, not added again;
@@ -504,11 +592,9 @@ Logged `POST /v1/messages` replies carry the same OCX request-history id in **bo
 streaming and JSON, and logged refusals. Claude Code can use its persisted `requestId`
 metadata from `request-id` to join future transcripts to that OCX history row.
 
-On native delivered replies and upstream HTTP errors, an opaque Anthropic upstream
-`request-id` matching `req_[A-Za-z0-9_-]{1,128}` is preserved separately as
-`x-opencodex-upstream-request-id`. It is a provider diagnostic id, not an OCX ledger key.
-Missing or nonconforming upstream ids, and translated adapter ids, are omitted. These
-response headers are readable through CORS alongside existing exposed headers.
+Upstream request IDs are omitted. Logged Messages replies expose only the proxy's
+`request-id` and `x-opencodex-request-id`; these headers remain readable through CORS
+alongside existing exposed headers.
 
 No OCX id is added to authentication, origin, drain or active-turn refusals that have no
 request-log owner, or to count_tokens. Streaming headers identify the turn's eventual
@@ -622,6 +708,14 @@ Non-streaming output has `object: "chat.completion"`. Streaming output uses SSE 
 `data: [DONE]`. Tool-call and usage information are translated back where the source events carry
 them.
 
+Error responses and streamed error frames on this endpoint use proxy-written messages. The proxy
+classifies a provider failure into a fixed condition, such as rate limited, quota or credits
+exhausted, context window exceeded, model unavailable, location not supported, or account
+verification required, and returns the fixed message for that condition. Policy refusals, replay
+refusals, and proxy limits have their own fixed messages. The HTTP status, `error.type`,
+`error.code`, and `Retry-After` keep their meaning, so clients that branch on codes such as
+`context_length_exceeded`, `insufficient_quota`, or `rate_limit_exceeded` behave as before.
+
 If a streaming Chat request receives a complete JSON Responses result upstream, the proxy
 synthesizes SSE from the converted completion. It preserves answer and reasoning content,
 function tool calls (with a separate stream `index` for each call), usage, and the converted
@@ -648,6 +742,23 @@ returned as an error instead of silently changing its meaning.
 These endpoints speak the Anthropic Messages dialect used by Claude Code and compatible clients.
 Most requests are translated to Responses, routed normally, then translated back to Anthropic JSON
 or Anthropic SSE.
+
+Native and caller-forward SSE use error-response normalization only when the first non-comment
+field of a block is exactly `event:error` or `event: error`. Leading comments pass through without
+consuming that slot. Data/id/retry/other-event/unknown-first blocks retain their bytes and delivery timing,
+even if a later field names error; their error data is outside this normalization scope. Final
+contained errors contain only the error declaration, data fields and terminator; id, retry, comment,
+unknown and repeated event fields after the declaration are omitted, also when data is empty.
+No possible-event prefix is delayed. Split CR/LF delimiters preserve delivery of later events and stream completion.
+
+After an eligible declaration, one error suffix is held up to 1 MiB. Within the bound, a later
+non-error rename replays the original suffix unchanged after the boundary decision; that suffix is
+delayed. Otherwise the full selected SDK diagnostic determines fixed error wording and recovery.
+Above the bound, even a later rename forces api_error with no code and the fixed sentence
+`The provider stream reported an error.`, containing no compaction phrase. This OVERSIZE-1M
+exception changes error data/recognition with HTTP status unchanged. The independent FOLD-502
+exception changes native non-stream collected-error envelopes from 200 to 502; it retains their
+existing payload presentation. Buffered successful passthrough bodies retain their original bytes.
 
 On translated Messages requests, reasoning replay shares the request's translation budget.
 Envelope admission includes encoding/decoding copy overhead, not just the original signature
@@ -728,6 +839,10 @@ the snapshot is `{ "version": 1, "models": [] }`; connected Desktop apply treats
 unavailable and does not write a replacement profile. Old hubs returning an ordinary catalog
 instead of version 1 are unsupported; the client does not fall back to locally generated IDs.
 
+If a newer discovery supersedes the request, the hub returns HTTP 503 with the error code
+`desktop_snapshot_busy` and `Retry-After: 1`. Connected apply leaves the existing Desktop
+profile byte-for-byte intact.
+
 The snapshot remains a read-only model-list contract; it is not a key-rotation or profile-upload
 API. Connected Desktop key migration, recovery and disconnect operate through the existing client
 lifecycle. Rotation preserves model entries and selections; CLI `rotation` distinguishes
@@ -736,6 +851,53 @@ standard fallback, preserving user fields and later valid selections. Conflicts 
 recovery prevent a completion claim. Restart Desktop to load disk changes; disconnect does not
 automatically revoke the hub key. See [Claude Desktop lifecycle](/guides/claude-code/).
 Thinking replay and prompt-cache work remain separate in [#3719](https://github.com/lidge-jun/opencodex/issues/3719).
+
+## Gemini API: `/v1beta/models` and `/v1beta/interactions`
+
+The **Gemini API** switch under the dashboard's **Gateway endpoints** controls access to these
+routes. While the API is open, **Usage examples** includes a copyable `generateContent` request.
+See [API surfaces](/reference/configuration/server/#api-surfaces-apisurfaces).
+
+Gemini clients, such as the google-genai SDK with a custom base URL, the `agy` CLI or a client reading
+`GOOGLE_GEMINI_BASE_URL`, can reach the configured provider routes in Google's REST shape. The proxy
+normally translates generation onto its Chat Completions path, so the route behind it can be any
+provider. Eligible Antigravity generation can use [native passthrough](#native-gemini-with-antigravity) when enabled.
+Authenticate with a proxy API key in `x-goog-api-key` or a `?key=` query parameter; the key is removed
+from the URL and headers before the request is logged or forwarded. Errors use Google's
+`{ "error": { "code", "message", "status" } }` shape.
+
+- `GET /v1beta/models` lists `models/<provider>/<model>` for the routes the key may use, and
+  `GET /v1beta/models/{model}` returns one. A model includes `inputTokenLimit` and `outputTokenLimit`
+  when they are known. For `inputTokenLimit`, provider input and context-window overrides take precedence,
+  followed by the matching `customModels[].contextWindow` and generated model metadata.
+- `:generateContent` and `:streamGenerateContent`, under `/v1beta/models/` or `/v1/models/`, translate
+  `contents`, `systemInstruction`, inline images, function declarations and calls, and
+  `generationConfig`. Thought signatures on `functionCall` parts are carried in both directions. With
+  `alt=sse` the stream is SSE; without it the answer is one JSON array, as Google's REST API sends it.
+  Hosted Gemini tools are ignored. A `candidateCount` other than 1, non-image inline data and file parts
+  are refused with 400.
+- `:countTokens` returns `{ "totalTokens": n }` from a local estimate and sends nothing upstream.
+  `:embedContent` and `:batchEmbedContents` answer 501.
+- `POST /v1beta/interactions`, or `POST /v1/interactions`, creates an interaction from `input` (text,
+  base64 images, or steps including `function_call` and `function_result`), `system_instruction`,
+  `function` tools, `generation_config` and a text `response_format`. A stream uses the Interactions
+  events `interaction.created`, `step.start`, `step.delta`, `step.stop` and `interaction.completed`. A
+  turn that ends in function calls has status `requires_action`. Fields the proxy cannot honor are
+  refused with 400: `agent`, `background: true`, `webhook_config`, `environment`, `agent_config`,
+  `safety_settings`, hosted tools, input content other than text and images, and non-text output.
+  The routed provider applies its own safety policy.
+- `previous_interaction_id` continues a stored interaction. The proxy keeps interactions in memory only,
+  for at most 24 hours after the last write, and only the key that created one can read, continue or
+  delete it; a keyless loopback caller shares one owner. Retention is best effort: each key keeps at most
+  200 interactions and 16 MiB, the proxy keeps at most 1,000 and 64 MiB in total, and the proxy's memory
+  budget can remove interactions earlier. When the store is full, a key with nothing of its own to make
+  room with gets its answer without the interaction being kept, and so does an interaction larger than
+  8 MiB or the configured inbound body limit, whichever is smaller. A buffered answer reports whether it
+  was kept in `x-opencodex-interaction-stored: true|false`. A restart forgets them all, and a missing
+  or expired id answers 404, so a client should keep its history to resend it. A request with
+  `store: false` is not kept. `GET /v1beta/interactions/{id}` returns a stored interaction, `DELETE`
+  removes it, and `POST /v1beta/interactions/{id}/cancel` answers 400 because nothing runs in the
+  background. Both Interactions aliases return `Cache-Control: no-store`.
 
 ## `POST /v1/live` and Realtime sideband
 
@@ -834,6 +996,12 @@ and of `decodesNativeCompactionBlobs` for replay. None grants canonical OpenAI i
 caller credential forwarding. Cross-provider overrides remain portable; v2 success alone
 does not establish support for `/responses/compact`. See [provider configuration](/reference/configuration/providers/).
 
+Malformed OpenCodex-owned retained-compaction input (`ocx2:`) on a compact
+request returns HTTP 400 with `error.type: "invalid_request_error"` before
+routing, account selection, credential refresh, or upstream dispatch. This
+caller validation error does not trigger upstream retries or record a failure
+against a pooled Codex account.
+
 If the native compact endpoint returns HTTP 404, OpenCodex retries compaction through a regular
 Responses turn with the same model selector and session headers. Canonical ChatGPT fallback
 turns use upstream SSE; the compact caller still receives JSON. A completed native opaque
@@ -922,7 +1090,7 @@ Errors use the client dialect's envelope where needed, but these status/code mea
 | --- | --- | --- |
 | 401 | `authentication_error` | A required proxy admission credential is missing or invalid |
 | 403 | `origin_rejected` | A Responses/OpenAI data-plane request or WebSocket upgrade came from a disallowed origin |
-| 503 | `combo_unavailable` | Every target in the selected combo is unavailable, in cooldown, disabled, or otherwise ineligible |
+| 503 | `combo_unavailable` | Every target in the selected combo is unavailable, in cooldown, disabled, or otherwise ineligible. `error.combo` carries the cause class and target counts; see [Why do I get `combo_unavailable`?](/guides/combos/#why-do-i-get-combo_unavailable) |
 | 400 | `unreadable_encrypted_agent_task` | An encrypted v2 worker task has no eligible canonical ChatGPT target or direct key-auth Responses target explicitly trusted with `allowEncryptedV2AgentTasks: true` that can consume it |
 | 426 | `upgrade_required` | The Responses WebSocket transport is disabled or the upgrade failed; use HTTP |
 
@@ -985,3 +1153,61 @@ Routed requests tolerate malformed serialized function arguments as an empty obj
 Two bounded history repairs preserve usable arguments: a missing JSON object prefix,
 and MiMo's trailing `</function></tool_call>` envelope with a missing closing quote or brace.
 A repair must decode to a JSON object. Valid JSON values containing those tags are preserved.
+
+## Native Gemini with Antigravity
+
+Enable the canonical `google-antigravity` provider, sign in with `ocx login google-antigravity`,
+then open the Google Antigravity **Accounts** tab and turn on **Native Gemini passthrough**.
+The dashboard and JSON config use the same setting:
+
+```json
+{
+  "protocols": {
+    "rollout": {
+      "geminiNativeAntigravity": true
+    }
+  }
+}
+```
+
+The default is off. Use the usual Gemini-compatible API at `/v1beta` with
+`x-goog-api-key` or `?key=` for an OpenCodex admission key. An eligible selector such as
+`google-antigravity/gemini-3.8-flash` uses the native leg for `generateContent` and
+`streamGenerateContent`. The proxy chooses the Cloud Code Assist model from the resolved
+route. With OAuth account failover enabled, it can choose another usable account according
+to that account's discovered models and the configured strategy. If the selected account
+is known to lack the model and no replacement is allowed, the proxy returns 403. The token
+and project always come from the same account. Other providers and `/v1` requests use the
+Chat bridge.
+
+The proxy preserves successful request and response JSON source, including unknown fields,
+large integers, function arguments, and thought signatures. Streaming uses SSE with
+`alt=sse` or a streamed JSON array otherwise. `GET /v1beta/models` and model lookup include
+eligible, live-discovered Gemini models from the Antigravity discovery cache alongside configured
+models. Refresh the Antigravity model list in OpenCodex to populate the cache. Native wire aliases
+are available when the exact selector routes to that Antigravity model and the admission key
+allows it. Requests sent through the native path show **Gemini → Gemini · Native** in the
+dashboard's request logs. When a completed response reports token counts, the log displays
+them and computes the end-to-end output rate. For models with a matched official rate, the
+`~$` column estimates the equivalent Gemini API cost from reported input, output and cache-hit
+tokens. The amount is an API price reference for Antigravity OAuth sessions.
+The log details show the selected provider and model and the router's selection reason.
+The upstream attempts table shows each send's status, opaque account label and recovery reason.
+If an upstream 401 triggers a successful credential refresh and replay, the refusal and replay appear
+as separate attempts. When only some attempts have an estimate, the log shows the known cost subtotal
+and the number of attempts that could not be priced.
+The log details also show the named reasoning tier or explicit thinking control and the first
+visible output time for a stream. Decode throughput is estimated from the observed output
+window when it includes the reported reasoning output.
+
+If an upstream payload contains bound account credentials, the proxy returns a generic
+Gemini error. A valid upstream `[DONE]` or a Gemini error ends stream delivery.
+
+Send identity-encoded JSON. Request and buffered response bodies and SSE events have a
+16 MiB cap. A lower `maxInboundBodyBytes` also applies to requests. Upload inactivity has
+its own timeout. The first send and up to one 401 recovery on the same account count
+against workflow physical-send ceilings. For root, identity, and pool token budgets, each
+send reserves estimated input and the requested `maxOutputTokens` for each candidate.
+An insufficient budget returns 429 with `workflow_spend_exhausted`. Completed requests
+settle against Gemini's reported input and output counts. A send without final usage retains
+its reservation amount as unresolved spend.

@@ -1,3 +1,4 @@
+import { boundedServiceTier } from "../lib/response-service-tier";
 import type {
   AttemptTierOutcome,
   FastWire,
@@ -201,12 +202,13 @@ export function resolveFastPolicy(
   authority: FastPolicyAuthority,
   modelId: string,
   inbound: InboundWire = "responses",
+  effectiveAdapter?: string,
 ): ResolvedFastPolicy {
-  const { adapter, hardPinned, forwardCallerServiceTier } = resolvePolicyAdapter(
-    authority,
-    modelId,
-    inbound,
-  );
+  const policyAdapter = resolvePolicyAdapter(authority, modelId, inbound);
+  const { adapter, hardPinned, forwardCallerServiceTier } =
+    effectiveAdapter === undefined || effectiveAdapter === policyAdapter.adapter
+      ? policyAdapter
+      : { adapter: effectiveAdapter, hardPinned: false, forwardCallerServiceTier: undefined };
   const exactCapability = exactModelValue(authority.capability.models, modelId);
   const capability = authority.capability.provider === false
     ? false
@@ -361,7 +363,7 @@ export function createAdapterTierMetadata(
     return {
       outcome,
       observeResponseServiceTier(value: unknown) {
-        const sanitized = sanitizeLogMetadataString(value);
+        const sanitized = boundedServiceTier(value);
         if (sanitized) outcome.responseServiceTier = sanitized;
       },
       markResponseUnparseable() {},
@@ -413,7 +415,7 @@ export function createAdapterTierMetadata(
         }
         return;
       }
-      const sanitized = sanitizeLogMetadataString(value);
+      const sanitized = boundedServiceTier(value);
       if (sanitized) outcome.responseServiceTier = sanitized;
       if (!responseCanConfirmFast) return;
       if (canonicalFromWire(context.fastWire, value) === "priority") {

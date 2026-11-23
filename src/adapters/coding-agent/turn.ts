@@ -1,4 +1,4 @@
-import { execFileSync, spawn as nodeSpawn, type ChildProcess, type SpawnOptions } from "node:child_process";
+import { spawn as nodeSpawn, type ChildProcess, type SpawnOptions } from "node:child_process";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, win32 } from "node:path";
@@ -23,6 +23,7 @@ import {
 } from "./protocol";
 import { isBatchDispatcher, resolveCodingAgentBinary, resolveProfileByBaseUrl, type CodingAgentProviderProfile, type WhichFn } from "./profile";
 import { inspectBatchDispatcher, type ReadDispatcherFn } from "./batch-dispatcher";
+import { killWindowsProcessTree } from "./process-tree";
 
 /** Injectable spawn for tests; production uses node:child_process. */
 export type SpawnFn = (command: string, args: readonly string[], options: SpawnOptions) => ChildProcess;
@@ -57,14 +58,6 @@ const DEFAULT_TIMEOUT_MS = 300_000;
 const DEFAULT_KILL_GRACE_MS = 2_000;
 /** Bound captured stderr so an error message can never carry an unbounded (or secret) payload. */
 const MAX_STDERR_BYTES = 8 * 1024;
-
-function killWindowsProcessTree(pid: number): void {
-  const taskkill = `${process.env.SystemRoot ?? "C:\\Windows"}\\System32\\taskkill.exe`;
-  execFileSync(taskkill, ["/PID", String(pid), "/T", "/F"], {
-    stdio: "pipe",
-    windowsHide: true,
-  });
-}
 
 /** Env keys a CLI needs to run; everything else is dropped so the child env is scoped and deterministic. */
 const INHERITED_ENV_KEYS = [
@@ -153,7 +146,7 @@ export interface CodingAgentToolBridgeInput {
   tools: ReadonlyArray<{ name: string; description: string; inputSchema: Record<string, unknown> }>;
   /** CLI-emitted tool name (`mcp__<server>__<tool>`) to the request's wire tool name. */
   emittedNameMap: Map<string, string>;
-  /** Claude replay may emit an exact selected wire name instead of its MCP transport name.
+  /** A CLI may emit an exact selected wire name instead of its MCP transport name.
    * These aliases are output-only: they never enter the CLI's --allowedTools list. */
   acceptWireToolNames?: boolean;
   /** Tool_use blocks accepted in one assistant message. */
@@ -481,7 +474,11 @@ export async function runCodingAgentTurn(input: CodingAgentTurnInput): Promise<v
     strictToolBlockCapture: Boolean(toolBridge),
     partialToolCallIds: toolBridge ? new Set<string>() : undefined,
     completeAssistantToolUse: toolBridge?.completeAssistantToolUse,
-    toolBridgeNames: toolBridge?.completeAssistantToolUse ? toolBridge.emittedNameMap : undefined,
+    toolBridgeNames: toolBridge?.completeAssistantToolUse
+      ? profile.family === "qoder" && wireToolNames
+        ? new Map([...toolBridge.emittedNameMap, ...Array.from(wireToolNames, name => [name, name] as const)])
+        : toolBridge.emittedNameMap
+      : undefined,
   };
   const toolTurnCompletionSignal = toolBridge?.toolTurnCompletionSignal ?? "message_stop";
   const sawSelectedToolTurnStop = (): boolean => toolTurnCompletionSignal === "assistant_tool_use_stop"

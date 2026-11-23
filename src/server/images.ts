@@ -1,3 +1,5 @@
+import { CodexInstallationIdUnavailableError } from "../codex/installation-id";
+import { isolateCodexPoolClientMetadata, mergeCodexSelectedHeaders } from "../codex/forward-transport-headers";
 /**
  * /v1/images/{generations,edits} relay (issue #83).
  *
@@ -30,6 +32,8 @@ import { sidecarEnter } from "../lib/sidecar-tracker";
 import { isNonReplayableResponse } from "../lib/upstream-retry";
 import type { OcxConfig } from "../types";
 import { resolveFirstUsableOpenAiSidecar, selectImagesProvider } from "../providers/openai-sidecar";
+import { isProviderApiKeyPaused, ProviderApiKeyPausedError } from "../providers/api-key-pause";
+import { resolveCurrentProviderApiKeyTransport } from "../providers/api-key-selection";
 import { recordDistributedKeyFailure, selectProactiveApiKeyTransport } from "../providers/key-failover";
 import { requestPacingOverloadResponse } from "./responses/pacing-overload";
 import { getProviderRegistryEntry } from "../providers/registry";
@@ -51,7 +55,7 @@ import {
   type PinnedDownloadFn,
 } from "../images/artifacts";
 import { findXaiProvider, resolveXaiImageAuthToken } from "../images/plan";
-import { callXaiImages } from "../images/xai-client";
+import { callXaiImages, XAI_DEFAULT_IMAGE_MODEL, XAI_MAX_EDIT_IMAGES } from "../images/xai-client";
 import type { AdmissionLease } from "../lib/admission";
 import { codexAccountSelectionForTurn } from "./lifecycle";
 import { codexModelAvailabilityErrorResponse } from "./responses/codex-auth-error";
@@ -127,7 +131,24 @@ export async function readImageResponseBytes(
 }
 
 const CCA_IMAGE_MODEL = "gemini-3.1-flash-image";
-const XAI_IMAGE_BRIDGE_MODEL = "grok-imagine-image-quality";
+
+/** An edit source xAI can fetch: an https URL without credentials, or a base64 image data URL. */
+function isXaiEditSourceUrl(value: string): boolean {
+  const data = /^data:image\/(?:png|jpeg|jpg|webp);base64,(.*)$/is.exec(value);
+  if (data) {
+    // Canonical base64 only: whole quads, padding at the end and nowhere else, and unused
+    // padding bits zero (decoding and re-encoding must give back the same text).
+    const payload = data[1]!;
+    return payload.length > 0 && payload.length % 4 === 0 && /^[A-Za-z0-9+/]+={0,2}$/.test(payload)
+      && Buffer.from(payload, "base64").toString("base64") === payload;
+  }
+  try {
+    const url = new URL(value);
+    return url.protocol === "https:" && url.hostname !== "" && !url.username && !url.password;
+  } catch {
+    return false;
+  }
+}
 
 /**
  * The model this request names, or undefined when it names none.
@@ -488,7 +509,7 @@ async function tryXaiImageRelay(
   if (config.images?.bridgeEnabled !== true) return undefined;
   const found = findXaiProvider(config);
   if (!found) return undefined;
-  const bridgeModel = config.images?.bridgeModel ?? XAI_IMAGE_BRIDGE_MODEL;
+  const bridgeModel = config.images?.bridgeModel ?? XAI_DEFAULT_IMAGE_MODEL;
   // The bridge sends this request to the configured xAI provider and the bridge
   // model regardless of the selector in the body, so that is what the key is
   // checked against.
@@ -511,20 +532,43 @@ async function tryXaiImageRelay(
   const quality = typeof obj.quality === "string" ? obj.quality : undefined;
   const aspectRatio = typeof obj.aspect_ratio === "string" ? obj.aspect_ratio : undefined;
   let imageUrl: string | undefined;
+  let imageUrls: string[] | undefined;
   if (endpoint === "edits") {
-    const images = obj.images;
-    const first = Array.isArray(images) ? images[0] : undefined;
-    if (typeof obj.image === "string") imageUrl = obj.image;
-    else if (typeof obj.image_url === "string") imageUrl = obj.image_url;
-    else if (first && typeof first === "object" && first !== null) {
-      const rec = first as Record<string, unknown>;
-      if (typeof rec.image_url === "string") imageUrl = rec.image_url;
-      else if (typeof rec.url === "string") imageUrl = rec.url;
+    const sources: string[] = [];
+    // Every supplied source must be a usable URL: silently dropping one would buy an edit
+    // missing an image the caller sent. xAI takes a public https URL or a base64 image data URL;
+    // an explicit null counts as supplied.
+    let unusable = false;
+    const add = (value: unknown) => {
+      const url = typeof value === "string" ? value.trim() : "";
+      if (isXaiEditSourceUrl(url)) sources.push(url);
+      else unusable = true;
+    };
+    if (obj.image !== undefined) add(obj.image);
+    if (obj.image_url !== undefined) add(obj.image_url);
+    if (obj.images !== undefined) {
+      if (!Array.isArray(obj.images)) unusable = true;
+      else for (const entry of obj.images) {
+        if (typeof entry === "string") { add(entry); continue; }
+        if (!entry || typeof entry !== "object" || Array.isArray(entry)) { unusable = true; continue; }
+        // Every URL-bearing property of an entry is a supplied source; an entry with none
+        // (a file_id, say) cannot be represented.
+        const rec = entry as Record<string, unknown>;
+        if (rec.image_url === undefined && rec.url === undefined) { unusable = true; continue; }
+        if (rec.image_url !== undefined) {
+          const nested = rec.image_url;
+          if (nested && typeof nested === "object" && !Array.isArray(nested)) add((nested as Record<string, unknown>).url);
+          else add(nested);
+        }
+        if (rec.url !== undefined) add(rec.url);
+      }
     }
-    if (!imageUrl?.trim()) {
-      return formatErrorResponse(400, "invalid_request_error", "image edits require an image URL");
-    }
-    imageUrl = imageUrl.trim();
+    if (unusable) return formatErrorResponse(400, "invalid_request_error", "xAI image edits need every image as a URL");
+    // Same rule as callXaiImages: duplicates collapse first, then the five-source limit applies.
+    const unique = [...new Set(sources)];
+    if (unique.length > XAI_MAX_EDIT_IMAGES) return formatErrorResponse(400, "invalid_request_error", "xAI image edits accept at most 5 images");
+    [imageUrl, ...imageUrls] = unique;
+    if (!imageUrl) return formatErrorResponse(400, "invalid_request_error", "image edits require an image URL");
   }
   const timeoutMs = config.images?.timeoutMs ?? IMAGES_UPSTREAM_TIMEOUT_MS;
   const linkedSignal = signalWithTimeout(timeoutMs, signal);
@@ -553,6 +597,7 @@ async function tryXaiImageRelay(
         quality,
         aspectRatio,
         imageUrl,
+        imageUrls,
       },
       { baseUrl: "https://api.x.ai/v1", token },
       linkedSignal.signal,
@@ -667,8 +712,8 @@ export async function handleImages(
     const xaiRelay = await tryXaiImageRelay(body, config, logCtx, req.signal, endpoint, admission);
     if (xaiRelay) return xaiRelay;
   }
-  if (candidates.error) {
-    return formatErrorResponse(400, "invalid_request_error", candidates.error);
+  if (candidates.error && (config.images?.provider !== undefined || !candidates.paused)) {
+    return formatErrorResponse(candidates.paused ? 403 : 400, candidates.paused ? "permission_error" : "invalid_request_error", candidates.error);
   }
   const explicitKeyedProvider = config.images?.provider !== undefined && candidates.keyed !== undefined;
   // Admission bearer is valid proxy auth (requireApiAuth already passed) but must never be
@@ -707,6 +752,9 @@ export async function handleImages(
     const ccaResponse = await tryCcaImageGeneration(body, config, logCtx, req.signal, endpoint, admission);
     if (ccaResponse) return ccaResponse;
     if (forwardScopeDenial) return forwardScopeDenial;
+    if (candidates.paused) {
+      return formatErrorResponse(403, "permission_error", candidates.error ?? new ProviderApiKeyPausedError().message);
+    }
     // 400, not 5xx: codex retries every 5xx up to 5 total attempts, and this is a permanent
     // configuration state that must surface on the first attempt.
     return formatErrorResponse(
@@ -730,7 +778,9 @@ export async function handleImages(
       });
       if (forward) logCtx.provider = formatCodexProviderForLog(forward.providerName, codexLogAccountId(forward.authContext), config);
     } catch (err) {
-      if (err instanceof CodexAccountCooldownError) {
+      if (err instanceof CodexInstallationIdUnavailableError) {
+        forwardAuthError = formatErrorResponse(503, "server_busy", err.message);
+      } else if (err instanceof CodexAccountCooldownError) {
         forwardAuthError = cooldownErrorResponse(err);
       } else if (err instanceof CodexMainProfileDrainingError) {
         forwardAuthError = codexMainProfileDrainingResponse();
@@ -752,7 +802,7 @@ export async function handleImages(
     }
   }
 
-  const headers = new Headers({ "content-type": "application/json" });
+  let headers = new Headers({ "content-type": "application/json" });
   const releaseForwardProbe = (): void => {
     try { forward?.releaseProbeLease?.(); }
     catch { console.error("[images] Failed to release probe lease"); }
@@ -773,8 +823,7 @@ export async function handleImages(
     }
     const { provider } = forward;
     try {
-      for (const [name, value] of Object.entries(provider.headers ?? {})) headers.set(name, value);
-      for (const [name, value] of forward.headers) headers.set(name, value);
+      headers = mergeCodexSelectedHeaders({ "content-type": "application/json", ...provider.headers }, forward.headers);
       assertImagesUpstreamAuthorization(headers, config);
     } catch {
       releaseForwardProbe();
@@ -809,27 +858,47 @@ export async function handleImages(
     // Transport variant: this branch reads `provider.baseUrl` and `provider.headers` to build
     // the URL and the request, and it comes back with the credential already resolved.
     let warmKeyProvider;
-    try { warmKeyProvider = selectProactiveApiKeyTransport(config, providerName, candidates.keyed.provider); }
-    catch (error) {
+    let currentKeyProvider;
+    try {
+      warmKeyProvider = selectProactiveApiKeyTransport(config, providerName, candidates.keyed.provider);
+      currentKeyProvider = warmKeyProvider ?? resolveCurrentProviderApiKeyTransport(
+        config,
+        providerName,
+        { ...candidates.keyed.provider, _apiKeyAttempt: undefined },
+      );
+      if (isProviderApiKeyPaused(currentKeyProvider ?? config.providers[providerName])) {
+        throw new ProviderApiKeyPausedError();
+      }
+    } catch (error) {
+      if (error instanceof ProviderApiKeyPausedError) {
+        if (config.images?.provider === undefined) {
+          const ccaResponse = await tryCcaImageGeneration(body, config, logCtx, req.signal, endpoint, admission);
+          if (ccaResponse) return ccaResponse;
+        }
+        return formatErrorResponse(403, "permission_error", error.message);
+      }
+      if (error instanceof OAuthAccountPausedError) {
+        return formatErrorResponse(403, "permission_error", error.message);
+      }
       const refusal = requestPacingOverloadResponse(error);
       if (refusal) return refusal;
       throw error;
     }
-    const provider = warmKeyProvider ?? candidates.keyed.provider;
-    recordKeyFailure = (status, retryAfter) => { recordDistributedKeyFailure(config, providerName, provider._apiKeyAttempt, status, Date.now(), retryAfter); };
-    // No fall back to the earlier snapshot once a pick has happened. The picker COMMITS its
-    // choice before returning, so if the chosen reference will not resolve -- revoked keychain
-    // entry, unset env var -- sending the previous key would authenticate a non-idempotent
-    // POST with a credential the config no longer considers active, and the previous key is
-    // the one that was cooling. Fail loudly instead.
-    if (warmKeyProvider && !warmKeyProvider.apiKey?.trim()) {
+    const provider = currentKeyProvider;
+    if (!provider || !provider.apiKey?.trim()) {
       return formatErrorResponse(
         500,
         "configuration_error",
         `image generation selected an API key for "${providerName}" that cannot be resolved`,
       );
     }
-    const apiKey = warmKeyProvider?.apiKey ?? candidates.keyed.apiKey;
+    recordKeyFailure = (status, retryAfter) => { recordDistributedKeyFailure(config, providerName, provider._apiKeyAttempt, status, Date.now(), retryAfter); };
+    // No fall back to the earlier snapshot once a pick has happened. The picker COMMITS its
+    // choice before returning, so if the chosen reference will not resolve -- revoked keychain
+    // entry, unset env var -- sending the previous key would authenticate a non-idempotent
+    // POST with a credential the config no longer considers active, and the previous key is
+    // the one that was cooling. Fail loudly instead.
+    const apiKey = provider.apiKey;
     try {
       for (const [name, value] of Object.entries(provider.headers ?? {})) headers.set(name, value);
       headers.set("authorization", `Bearer ${apiKey}`);
@@ -844,6 +913,9 @@ export async function handleImages(
     // No usable OpenAI credential — try CCA before giving up.
     const ccaResponse = await tryCcaImageGeneration(body, config, logCtx, req.signal, endpoint, admission);
     if (ccaResponse) return ccaResponse;
+    if (candidates.paused) {
+      return formatErrorResponse(403, "permission_error", candidates.error ?? new ProviderApiKeyPausedError().message);
+    }
     return formatErrorResponse(
       401,
       "authentication_error",
@@ -866,7 +938,9 @@ export async function handleImages(
     upstreamResponse = await fetch(url, {
       method: "POST",
       headers,
-      body: JSON.stringify(body),
+      body: JSON.stringify(isolateCodexPoolClientMetadata(
+        body, forward?.authContext.kind === "pool" ? forward.authContext.chatgptAccountId : undefined,
+      )),
       signal: linkedSignal.signal,
       // Do not follow a cross-origin 3xx while carrying Codex credentials. Bun strips
       // `Authorization` across origins but forwards nonstandard headers, so
@@ -910,6 +984,10 @@ export async function handleImages(
       // lease taken by the selected Pool account must be returned explicitly.
       releaseForwardProbe();
       return formatErrorResponse(499, "client_closed_request", `image ${endpoint} request canceled by client`);
+    }
+    if (err instanceof CodexInstallationIdUnavailableError) {
+      releaseForwardProbe();
+      return formatErrorResponse(503, "server_busy", err.message);
     }
     if (linkedSignal.signal.aborted || (err instanceof Error && err.name === "TimeoutError")) {
       forward?.recordOutcome?.("timeout");

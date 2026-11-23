@@ -1,11 +1,10 @@
-import { afterEach, beforeEach, expect, test } from "bun:test";
-import { managementFetch as fetch } from "../helpers/management-auth";
+import { expect } from "bun:test";
+import { installEndpointHooks, test, fetch, startServer, serveUpstream, ownCleanup, caseSignal, testDir, isolatedCodexHome, originalFetch } from "../helpers/claude-endpoint-lifetime";
+import { redirectCanonicalCodexTo } from "../helpers/pool-retry-harness";
 import { logsFromApiBody } from "../helpers/logs-api";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { loadConfig, saveConfig } from "../../src/config";
-import { flushConfigDirHardeningAndReaps } from "../../src/config/paths";
 import { readRecentUsageEntries } from "../../src/usage/log";
 import { buildDesktop3pRegistry } from "../../src/claude/desktop-3p";
 import type { DesktopProfile } from "../../src/claude/desktop-profile";
@@ -18,7 +17,6 @@ import {
   hydrateRequestLogsFromDisk,
   type RequestLogContext,
 } from "../../src/server/request-log";
-import { startServer } from "../../src/server";
 import { ownedServiceHomeInspection } from "../helpers/owned-service-home-inspection";
 import {
   estimateClaudeRequestTokens,
@@ -30,9 +28,6 @@ import {
 } from "../../src/server/claude-messages";
 import { estimateTokens } from "../../src/lib/token-estimate";
 import type { OcxConfig } from "../../src/types";
-import { installIsolatedCodexHome, type IsolatedCodexHome } from "../helpers/isolated-codex-home";
-import { removeTreeWithRetry } from "../helpers/remove-tree";
-import { isolateClientLifecycleLock } from "../helpers/client-lifecycle-lock";
 import { acquireOwnedSpendHome } from "../helpers/owned-spend-home";
 import { SERVER_BUDGET_MS } from "../helpers/test-budget";
 import { createTestTranslatorBudget } from "../helpers/translator-budget";
@@ -49,37 +44,7 @@ import {
   waitForNativeMainStartupGate,
 } from "../../src/codex/native-profile-startup";
 
-let testDir = "";
-let lifecycleLock: ReturnType<typeof isolateClientLifecycleLock>;
-let previousHome: string | undefined;
-let previousDesktopConfigDir: string | undefined;
-let isolatedCodexHome: IsolatedCodexHome | null = null;
-const originalFetch = globalThis.fetch;
-
-beforeEach(() => {
-  previousHome = process.env.OPENCODEX_HOME;
-  isolatedCodexHome = installIsolatedCodexHome("ocx-claude-endpoint-");
-  testDir = mkdtempSync(join(tmpdir(), "ocx-claude-endpoint-"));
-  lifecycleLock = isolateClientLifecycleLock(testDir);
-  process.env.OPENCODEX_HOME = testDir;
-  previousDesktopConfigDir = process.env.OPENCODEX_CLAUDE_DESKTOP_CONFIG_DIR;
-  process.env.OPENCODEX_CLAUDE_DESKTOP_CONFIG_DIR = join(testDir, "claude-desktop");
-  globalThis.fetch = originalFetch;
-});
-
-afterEach(async () => {
-  if (testDir) await flushConfigDirHardeningAndReaps(testDir);
-  lifecycleLock.restore();
-  if (isolatedCodexHome) await flushConfigDirHardeningAndReaps(isolatedCodexHome.path);
-  if (previousHome === undefined) delete process.env.OPENCODEX_HOME;
-  else process.env.OPENCODEX_HOME = previousHome;
-  if (previousDesktopConfigDir === undefined) delete process.env.OPENCODEX_CLAUDE_DESKTOP_CONFIG_DIR;
-  else process.env.OPENCODEX_CLAUDE_DESKTOP_CONFIG_DIR = previousDesktopConfigDir;
-  isolatedCodexHome?.restore();
-  isolatedCodexHome = null;
-  globalThis.fetch = originalFetch;
-  if (testDir) removeTreeWithRetry(testDir);
-});
+installEndpointHooks();
 
 function mockChatUpstream() {
   return mockChatUpstreamCapturing().server;
@@ -88,7 +53,7 @@ function mockChatUpstream() {
 function mockChatUpstreamCapturing() {
   const captured: Array<Record<string, unknown>> = [];
   const urls: string[] = [];
-  const server = Bun.serve({
+  const server = serveUpstream({
     port: 0,
     async fetch(req) {
       urls.push(req.url);
@@ -244,11 +209,11 @@ test("Desktop OFF leaves Claude messages and health live", async () => {
     await server.stop(true);
     upstream.stop(true);
   }
-});
+}, { timeout: SERVER_BUDGET_MS });
 
 test("native generated-agent passthrough preserves legacy thinking", async () => {
   let captured: Record<string, unknown> | null = null;
-  const upstream = Bun.serve({
+  const upstream = serveUpstream({
     port: 0,
     async fetch(req) {
       captured = await req.json() as Record<string, unknown>;
@@ -299,7 +264,7 @@ test("native generated-agent passthrough preserves legacy thinking", async () =>
 
 test("native Anthropic passthrough clears the header deadline before streaming the body", async () => {
   const encoder = new TextEncoder();
-  const upstream = Bun.serve({
+  const upstream = serveUpstream({
     port: 0,
     fetch() {
       const body = new ReadableStream<Uint8Array>({
@@ -622,7 +587,7 @@ test("synthetic error tail parses as a terminal error in the Anthropic dialect (
 });
 
 test("endpoint wiring: configured bodyStallSec bounds a stalled native passthrough stream", async () => {
-  const upstream = Bun.serve({
+  const upstream = serveUpstream({
     port: 0,
     fetch() {
       const body = new ReadableStream<Uint8Array>({
@@ -659,79 +624,113 @@ test("endpoint wiring: configured bodyStallSec bounds a stalled native passthrou
     await server.stop(true);
     upstream.stop(true);
   }
-});
+}, { timeout: SERVER_BUDGET_MS });
 
-test("native openai-responses route carries prompt_cache_key + synthesized session_id header", async () => {
-  const capture: { headers?: Record<string, string>; body?: Record<string, any> } = {};
-  const upstream = Bun.serve({
-    port: 0,
-    async fetch(req) {
-      const url = new URL(req.url);
-      if (!url.pathname.endsWith("/responses")) {
-        return Response.json({ error: { message: `unexpected path ${url.pathname}` } }, { status: 404 });
-      }
-      capture.headers = Object.fromEntries(req.headers);
-      capture.body = await req.json() as Record<string, any>;
-      const frames = [
-        `event: response.created\ndata: ${JSON.stringify({ response: { id: "resp_1", status: "in_progress" } })}\n\n`,
-        `event: response.output_text.delta\ndata: ${JSON.stringify({ delta: "Hello" })}\n\n`,
-        `event: response.completed\ndata: ${JSON.stringify({ response: { status: "completed", usage: { input_tokens: 10, output_tokens: 2 } } })}\n\n`,
-      ];
-      return new Response(frames.join(""), { headers: { "Content-Type": "text/event-stream" } });
-    },
-  });
-  globalThis.fetch = ((input: RequestInfo | URL, init?: RequestInit) => {
-    const requestUrl = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
-    const url = new URL(requestUrl);
-    if (url.origin === "https://chatgpt.com") {
-      if (url.pathname !== "/backend-api/codex/responses") {
-        throw new Error(`unexpected canonical Codex path ${url.pathname}`);
-      }
-      return originalFetch(new URL("/responses", upstream.url), init);
-    }
-    return originalFetch(input, init);
-  }) as typeof fetch;
-  saveConfig({
-    port: 0,
-    defaultProvider: "native",
-    providers: {
-      native: { adapter: "openai-responses", baseUrl: "https://chatgpt.com/backend-api/codex", authMode: "forward" },
-    },
-  } as OcxConfig);
-  const server = startServer(0);
-  try {
-    const response = await fetch(new URL("/v1/messages", server.url), {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        model: "native/gpt-test",
-        max_tokens: 128,
-        messages: [{ role: "user", content: "hi" }],
-        metadata: { user_id: "user_abc123_account__session_11111111-2222-3333-4444-555555555555" },
-        thinking: { type: "adaptive", display: "omitted" },
-        output_config: { effort: "high" },
-      }),
+for (const [model, prependSystem, withSystem] of [
+  ["gpt-6.2-sol", true, true],
+  ["gpt-6.2-astra", true, true],
+  ["gpt-6.1-sol", false, true],
+  // No top-level system prompt: nothing is prepended and the late system message keeps its place.
+  ["gpt-6.2-sol", false, false],
+] as const) {
+  test(`native openai-responses route carries cache affinity and system placement for ${model}${withSystem ? "" : " without a system prompt"}`, async () => {
+    const capture: { headers?: Record<string, string>; body?: Record<string, any> } = {};
+    const upstream = serveUpstream({
+      port: 0,
+      async fetch(req) {
+        const url = new URL(req.url);
+        if (!url.pathname.endsWith("/responses")) {
+          return Response.json({ error: { message: `unexpected path ${url.pathname}` } }, { status: 404 });
+        }
+        capture.headers = Object.fromEntries(req.headers);
+        capture.body = await req.json() as Record<string, any>;
+        const frames = [
+          `event: response.created\ndata: ${JSON.stringify({ response: { id: "resp_1", status: "in_progress" } })}\n\n`,
+          `event: response.output_text.delta\ndata: ${JSON.stringify({ delta: "Hello" })}\n\n`,
+          `event: response.completed\ndata: ${JSON.stringify({ response: { status: "completed", usage: { input_tokens: 10, output_tokens: 2 } } })}\n\n`,
+        ];
+        return new Response(frames.join(""), { headers: { "Content-Type": "text/event-stream" } });
+      },
     });
-    expect(response.status).toBe(200);
-    await response.text();
-    // Native ChatGPT route: sampling params + user are stripped, but the cache-affinity
-    // pair survives — prompt_cache_key in the body and a synthesized session_id header
-    // (devlog 090: without the header the backend reported cached_tokens: 0 every turn).
-    expect(capture.body?.prompt_cache_key).toMatch(/^[0-9a-f]{32}$/);
-    expect(capture.body?.user).toBeUndefined();
-    expect(capture.body?.max_output_tokens).toBeUndefined();
-    expect(capture.body?.reasoning?.effort).toBe("high");
-    expect(capture.headers?.["session_id"]).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-8[0-9a-f]{3}-[0-9a-f]{12}$/);
-  } finally {
-    globalThis.fetch = originalFetch;
-    await server.stop(true);
-    upstream.stop(true);
-  }
-});
+    // This fixture serves HTTP/SSE only: refuse native WSS instead of reaching chatgpt.com.
+    const originalWebSocket = globalThis.WebSocket;
+    ownCleanup(() => { globalThis.WebSocket = originalWebSocket; });
+    redirectCanonicalCodexTo(upstream.url.toString());
+    globalThis.fetch = ((input: RequestInfo | URL, init?: RequestInit) => {
+      const requestUrl = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      const url = new URL(requestUrl);
+      if (url.origin === "https://chatgpt.com") {
+        if (url.pathname !== "/backend-api/codex/responses") {
+          throw new Error(`unexpected canonical Codex path ${url.pathname}`);
+        }
+        return originalFetch(new URL("/responses", upstream.url), init);
+      }
+      return originalFetch(input, init);
+    }) as typeof fetch;
+    saveConfig({
+      port: 0,
+      defaultProvider: "native",
+      providers: {
+        native: { adapter: "openai-responses", baseUrl: "https://chatgpt.com/backend-api/codex", authMode: "forward" },
+      },
+    } as OcxConfig);
+    const server = startServer(0);
+    try {
+      const response = await fetch(new URL("/v1/messages", server.url), {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          model: `native/${model}`,
+          max_tokens: 128,
+          ...(withSystem ? { system: [{ type: "text", text: "Keep answers brief." }, { type: "text", text: "Use plain text." }] } : {}),
+          messages: [
+            { role: "user", content: "hi" },
+            { role: "assistant", content: "hello" },
+            { role: "system", content: "A late instruction" },
+            { role: "user", content: "continue" },
+          ],
+          metadata: { user_id: "user_abc123_account__session_11111111-2222-3333-4444-555555555555" },
+          thinking: { type: "adaptive", display: "omitted" },
+          output_config: { effort: "high" },
+        }),
+      });
+      expect(response.status).toBe(200);
+      await response.text();
+      // Native ChatGPT route: sampling params + user are stripped, but the cache-affinity
+      // pair survives — prompt_cache_key in the body and a synthesized session_id header
+      // (devlog 090: without the header the backend reported cached_tokens: 0 every turn).
+      expect(capture.body?.model).toBe(model);
+      const system = "Keep answers brief.\n\nUse plain text.";
+      expect(capture.body?.instructions).toBe(prependSystem || !withSystem ? undefined : system);
+      const input = capture.body?.input;
+      expect(input?.map((item: { role?: string }) => item.role)).toEqual(
+        prependSystem ? ["developer", "user", "assistant", "developer", "user"]
+          : ["user", "assistant", "developer", "user"],
+      );
+      if (prependSystem) {
+        expect(input?.[0]).toEqual({
+          type: "message", role: "developer", content: [{ type: "input_text", text: system }],
+        });
+      }
+      expect(input?.[prependSystem ? 3 : 2]?.content).toEqual([
+        { type: "input_text", text: "A late instruction" },
+      ]);
+      expect(capture.body?.prompt_cache_key).toMatch(/^[0-9a-f]{32}$/);
+      expect(capture.body?.user).toBeUndefined();
+      expect(capture.body?.max_output_tokens).toBeUndefined();
+      expect(capture.body?.reasoning?.effort).toBe("high");
+      expect(capture.headers?.["session_id"]).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-8[0-9a-f]{3}-[0-9a-f]{12}$/);
+    } finally {
+      globalThis.fetch = originalFetch;
+      await server.stop(true);
+      upstream.stop(true);
+    }
+  });
+}
 
 test("native openai-responses Claude route logs cyber terminals as 400 cyber_policy", async () => {
   clearRequestLogsForTests();
-  const upstream = Bun.serve({
+  const upstream = serveUpstream({
     port: 0,
     fetch() {
       return new Response([
@@ -773,14 +772,14 @@ test("native openai-responses Claude route logs cyber terminals as 400 cyber_pol
       }),
     });
     expect(response.status).toBe(200);
-    expect(await response.text()).toContain("blocked");
+    expect(await response.text()).toContain("The provider rejected the request.");
     const entry = getRequestLogEntries().findLast(e => e.surface === "claude");
     expect(entry).toMatchObject({
       status: 400,
       errorCode: "cyber_policy",
       terminalStatus: "failed",
       closeReason: "terminal",
-      upstreamError: "blocked",
+      upstreamCondition: "request_rejected",
     });
   } finally {
     await server.stop(true);
@@ -794,7 +793,7 @@ test("custom forward openai-responses route never receives the main ChatGPT cred
     tokens: { access_token: "main-secret-must-not-leave", account_id: "main-account-must-not-leave" },
   }));
   const captured: Array<{ authorization: string | null; accountId: string | null }> = [];
-  const upstream = Bun.serve({
+  const upstream = serveUpstream({
     port: 0,
     fetch(req) {
       captured.push({
@@ -846,7 +845,7 @@ test("shadow-call rerouting cannot carry the main ChatGPT credential to a custom
     tokens: { access_token: "main-secret-must-not-leave", account_id: "main-account-must-not-leave" },
   }));
   const captured: Array<{ authorization: string | null; accountId: string | null }> = [];
-  const upstream = Bun.serve({
+  const upstream = serveUpstream({
     port: 0,
     fetch(req) {
       captured.push({
@@ -920,7 +919,7 @@ test("Claude replay owns optional main enrichment while routed work survives dra
   let markStarted!: () => void;
   const started = new Promise<void>(resolve => { markStarted = resolve; });
   const encoder = new TextEncoder();
-  const upstream = Bun.serve({
+  const upstream = serveUpstream({
     port: 0,
     fetch() {
       upstreamCalls += 1;
@@ -1027,7 +1026,7 @@ test("Claude replay owns optional main enrichment while routed work survives dra
     upstream.stop(true);
     resetLifecycleDrainStateForTests();
   }
-});
+}, { timeout: SERVER_BUDGET_MS });
 
 test("routed Claude requests give OpenAI sidecars main auth without leaking it to the routed provider", async () => {
   const mainAccessToken = "main-chatgpt-access";
@@ -1037,7 +1036,7 @@ test("routed Claude requests give OpenAI sidecars main auth without leaking it t
   const sidecarCalls: Array<{ headers: Headers; body: Record<string, any>; kind: "vision" | "web-search" }> = [];
   const routedCalls: Array<{ authorization: string | null; body: Record<string, any> }> = [];
 
-  const forward = Bun.serve({
+  const forward = serveUpstream({
     port: 0,
     async fetch(req) {
       const body = await req.json() as Record<string, any>;
@@ -1052,7 +1051,7 @@ test("routed Claude requests give OpenAI sidecars main auth without leaking it t
       ].join(""), { headers: { "content-type": "text/event-stream" } });
     },
   });
-  const routed = Bun.serve({
+  const routed = serveUpstream({
     port: 0,
     async fetch(req) {
       const body = await req.json() as Record<string, any>;
@@ -1128,11 +1127,13 @@ test("routed Claude requests give OpenAI sidecars main auth without leaking it t
   const invokeMessages = async (): Promise<number> => {
     const turnAdmissionLease = tryAdmitTurn();
     if (!turnAdmissionLease) throw new Error("test turn admission unavailable");
+    const releaseTurn = ownCleanup(() => turnAdmissionLease.release());
     const start = Date.now();
     try {
       const response = await handleClaudeMessages(
         new Request("http://localhost/v1/messages", {
           method: "POST",
+          signal: caseSignal(),
           headers: {
             "content-type": "application/json",
             "x-api-key": "placeholder",
@@ -1147,13 +1148,13 @@ test("routed Claude requests give OpenAI sidecars main auth without leaking it t
       await response.text();
       return response.status;
     } finally {
-      turnAdmissionLease.release();
+      releaseTurn();
     }
   };
   // One lease for the whole case rather than one per invocation: both turns run against the same
   // home, and re-taking it between them would discard the ledger this case is still accounting
   // into. File-wide would be wrong the other way, since most cases here start a real server.
-  const releaseSpendHome = acquireOwnedSpendHome();
+  const releaseSpendHome = ownCleanup(acquireOwnedSpendHome());
   try {
     expect(await invokeMessages()).toBe(200);
 
@@ -1414,7 +1415,7 @@ test("claudeCode.enabled=false -> 403 permission_error on both routes", async ()
 
 test("compatibility is uniform across translated adapters and rejects before inference", async () => {
   let sends = 0;
-  const upstream = Bun.serve({ port: 0, fetch() { sends++; return new Response("unexpected inference", { status: 500 }); } });
+  const upstream = serveUpstream({ port: 0, fetch() { sends++; return new Response("unexpected inference", { status: 500 }); } });
   const baseUrl = new URL("/v1", upstream.url).href;
   const features: Array<Record<string, unknown>> = [
     { messages: [{ role: "user", content: [{ type: "document", source: { type: "text", media_type: "text/plain", data: "private-fixture" } }] }] },
@@ -1473,7 +1474,7 @@ test("compatibility is uniform across translated adapters and rejects before inf
       } finally { await server.stop(true); }
     }
   } finally { await upstream.stop(true); }
-});
+}, { timeout: SERVER_BUDGET_MS });
 
 test("compatibility unset, shadow persistence and ordinary enforce controls", async () => {
   const { server: upstream, captured } = mockChatUpstreamCapturing();
@@ -1519,7 +1520,7 @@ test("compatibility unset, shadow persistence and ordinary enforce controls", as
     }
     expect(captured).toHaveLength(3);
   } finally { await upstream.stop(true); }
-});
+}, { timeout: SERVER_BUDGET_MS });
 
 test("present invalid compatibility modes return one fixed 503 before translation", async () => {
   const { server: upstream, urls } = mockChatUpstreamCapturing();
@@ -1549,11 +1550,11 @@ test("present invalid compatibility modes return one fixed 503 before translatio
     }
     expect(urls).toEqual([]);
   } finally { await upstream.stop(true); }
-});
+}, { timeout: SERVER_BUDGET_MS });
 
 test("native passthrough precedes even invalid compatibility mode", async () => {
   const received: unknown[] = [];
-  const upstream = Bun.serve({ port: 0, async fetch(req) {
+  const upstream = serveUpstream({ port: 0, async fetch(req) {
     received.push(await req.json());
     return Response.json({ id: "msg_test", type: "message", role: "assistant", model: "claude-haiku-4-5",
       content: [{ type: "text", text: "ok" }], stop_reason: "end_turn", stop_sequence: null, usage: { input_tokens: 1, output_tokens: 1 } });
@@ -1576,7 +1577,7 @@ test("native passthrough precedes even invalid compatibility mode", async () => 
     }
     expect(received).toEqual([body, body]);
   } finally { await upstream.stop(true); }
-});
+}, { timeout: SERVER_BUDGET_MS });
 
 test("compatibility survives management toggles and rejects Desktop source features", async () => {
   const { server: upstream, urls } = mockChatUpstreamCapturing();
@@ -1616,7 +1617,7 @@ test("compatibility survives management toggles and rejects Desktop source featu
     await server.stop(true);
     await upstream.stop(true);
   }
-});
+}, { timeout: SERVER_BUDGET_MS });
 
 test("shadow captures source thinking settings before an effort directive removes them", async () => {
   const { server: upstream, captured } = mockChatUpstreamCapturing();
@@ -1704,7 +1705,7 @@ test("generated agent effort directive restores exact xhigh and max after Claude
 
 test("generated agent effort directive preserves routed Anthropic structured output", async () => {
   const captured: Array<Record<string, unknown>> = [];
-  const upstream = Bun.serve({
+  const upstream = serveUpstream({
     port: 0,
     async fetch(req) {
       captured.push(await req.json() as Record<string, unknown>);

@@ -19,6 +19,7 @@ import { prepareEffortNormalization, stripEmptyLadderEffort, supportedLadderFor 
 import { resolveOpenCodeGoTransport } from "../../providers/opencode-go-transport";
 import { getOrAllocateRequestSessionLane } from "../request-log-conversation";
 import { shouldPreparePlaintextV2AgentMessages } from "../../responses/plaintext-v2-agent-messages";
+import { isPlaintextV2AgentMessagesEnabled } from "../../config/multi-agent-surface";
 import { hasValidatedActiveReasoningEffort } from "../../responses/parser";
 import { responseTierAuthorityForProvider } from "../../providers/openai-tiers-destination";
 import { isCanonicalOpenAiForwardProvider } from "../../providers/openai-tiers";
@@ -131,6 +132,24 @@ export async function resolveSubagentFallbackModelEligibility(args: {
 }
 
 
+/** Apply display preferences for the adapter that will produce the upstream reply. */
+export function applyReasoningDisplayPolicy(
+  parsed: OcxParsedRequest,
+  provider: OcxProviderConfig,
+  inboundWire: InboundWire,
+): void {
+  const summary = (parsed._rawBody as { reasoning?: { summary?: unknown } } | undefined)?.reasoning?.summary;
+  parsed.options.rawReasoningAsSummary = inboundWire === "responses"
+    && provider.adapter === "openai-chat" && provider.rawReasoningAsSummary === true
+    && summary !== "none";
+  if (inboundWire === "responses" && parsed._rawBody) {
+    parsed.options.hideThinkingSummary = summary === "none"
+      || (!summary && !hasValidatedActiveReasoningEffort(parsed.options)
+        && provider.showThinkingSummary !== true && !parsed.options.rawReasoningAsSummary);
+  }
+  parsed.options.hideRawReasoning = provider.hideRawReasoning === true;
+}
+
 /**
  * Apply every route-dependent request mutation against the final selected route.
  * Must run only after subagent fallback has settled the model/provider.
@@ -147,6 +166,7 @@ export async function applyFinalRouteRequestNormalization(args: {
   droidDefaultEffort?: HandleResponsesOptions["droidDefaultEffort"];
 }): Promise<void> {
   const { parsed, route, config, req, logCtx, inboundWire, inboundTransport } = args;
+  parsed._chatCompletionsInput = inboundWire === "chat";
   const effortSelector = prepareEffortNormalization(parsed, route);
   if (applyDroidResponsesReasoningDefault(
     parsed._rawBody,
@@ -156,6 +176,7 @@ export async function applyFinalRouteRequestNormalization(args: {
 
   // Only Anthropic message routes retain the Codex-facing selector. Other providers must keep
   // their existing response.model contract even when their public and wire model ids differ.
+  // Request preparation assigns the original client label separately for synthetic turns.
   const responseModelId = parsed.modelId;
   const preserveAnthropicResponseModel = route.providerName === "anthropic"
     || route.provider.adapter === "anthropic";
@@ -193,23 +214,13 @@ export async function applyFinalRouteRequestNormalization(args: {
     args.claudeGoAffinity ? args.claudeGoAffinity.sessionLane : getOrAllocateRequestSessionLane(req),
     routedProvider);
   parsed._plaintextV2AgentMessages = shouldPreparePlaintextV2AgentMessages({
-    enabled: config.plaintextV2AgentMessages === true,
+    enabled: parsed._plaintextV2Decision === true && isPlaintextV2AgentMessagesEnabled(config),
     inboundWire,
     canonicalChatGpt: isCanonicalOpenAiForwardProvider(route.provider),
     requestBody: parsed._rawBody,
   });
-  // Recompute from the original wire preference on every route, including fallback.
-  // A provider default never converts raw reasoning into a summary.
-  if (inboundWire === "responses" && parsed._rawBody) {
-    const summary = (parsed._rawBody as { reasoning?: { summary?: unknown } }).reasoning?.summary;
-    parsed.options.hideThinkingSummary = summary === "none"
-      || (!summary && !hasValidatedActiveReasoningEffort(parsed.options)
-        && route.provider.showThinkingSummary !== true);
-  }
-  // Provider policy, recomputed per final route like the summary default above so a fallback
-  // cannot inherit the previous target's choice. Raw content-channel reasoning is suppressed;
-  // provider-authored summaries stay on the summary channel and remain visible.
-  parsed.options.hideRawReasoning = route.provider.hideRawReasoning === true;
+  if (parsed._plaintextV2AgentMessages) parsed._plaintextV2EverPrepared = true;
+  applyReasoningDisplayPolicy(parsed, route.provider, inboundWire);
   if (preserveAnthropicResponseModel) parsed._responseModelId = responseModelId;
   logCtx.model = virtualModel?.selectedModelId ?? route.modelId;
   logCtx.provider = route.providerName;
@@ -346,10 +357,16 @@ export async function applyFinalRouteRequestNormalization(args: {
     // Native passthrough keeps its snapshot-owned effort contract, including saved exclusions.
     if (!shouldApplyNativeEffortClamp(route.providerName, route.provider, finalSelectedModelId)) {
       const previousEffort = parsed.options.reasoning;
+      const previousThinkingEnabled = parsed.options.thinkingEnabled;
       normalizeThinkingOptions(route.provider, route.modelId, parsed.options);
+      const raw = parsed._rawBody as { reasoning?: unknown } | undefined;
       if (previousEffort !== undefined && parsed.options.reasoning === undefined) {
-        const raw = parsed._rawBody as { reasoning?: unknown } | undefined;
         if (raw) raw.reasoning = stripEmptyLadderEffort(raw.reasoning, []);
+      }
+      if (previousThinkingEnabled !== undefined && parsed.options.thinkingEnabled === undefined
+        && raw?.reasoning && typeof raw.reasoning === "object" && !Array.isArray(raw.reasoning)) {
+        delete (raw.reasoning as { enabled?: boolean }).enabled;
+        if (Object.keys(raw.reasoning).length === 0) delete raw.reasoning;
       }
     }
     const { applyEffortCap, effortCapAppliesTo, supportedLadderFor } = await import("../effort-policy");

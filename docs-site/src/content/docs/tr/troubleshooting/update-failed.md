@@ -74,6 +74,45 @@ bildirir. Yalnızca içinden OpenCodex işlemi çalışmadığını doğruladık
 Bir klasör silinemiyorsa içinden çalışan işlem kalmış olabilir. Windows oturumunu
 kapatmak veya yeniden başlatmak kilidi serbest bırakır.
 
+## Her güncelleme ve senkronizasyon update-in-flight diyorsa
+
+Beklemeye, servisi yeniden başlatmaya veya bilgisayarı yeniden başlatmaya rağmen her `ocx update` ve
+`ocx sync` `update-in-flight` ile başarısız oluyorsa, yarıda kalan bir güncelleme işaret dosyasını
+geride bırakmış olabilir ([#8524](https://github.com/lidge-jun/opencodex/issues/8524)). Bu dosya
+OpenCodex ana dizinindeki `update-orchestrated.json` dosyasıdır (Windows'ta
+`%USERPROFILE%\.opencodex`, diğer sistemlerde `~/.opencodex`).
+
+Güncel sürümler Windows yükleyicisinin denetleyici sürecini bu dosyaya kaydeder. Dosya, 15 dakikalık
+koruma süresi dolduğunda ve o denetleyici ile başlatıcı kapandığında kendiliğinden temizlenir.
+2.100.x ve öncesi sürümler denetleyiciyi kaydetmiyordu. Bu sürümlerin yarıda kalan bir güncellemeden
+(kapatılan konsol, Ctrl+C, Görev Yöneticisi, uyku veya elektrik kesintisi) sonra bıraktığı dosya
+denetlenemez ve hiçbir zaman kendiliğinden temizlenmez. Neden buysa, terminaldeki `ocx update` ve
+`ocx sync` `update-in-flight` satırından sonra dosyanın yolunu ve yeniden adlandırma komutunu yazar.
+Pano, Desktop ve Remote Link yalnızca `update-in-flight` bildirir; yönergeyi görmek için
+`ocx update` komutunu bir terminalde çalıştırın.
+
+Dosyayı yeniden adlandırmadan önce hiçbir güncellemenin çalışmadığından emin olun:
+
+1. Başka bir pencerede `ocx update` veya pano güncellemesi sürmüyor.
+2. Hiçbir `npm`, `pnpm` veya `bun` genel kurulumu çalışmıyor. Windows'ta Görev Yöneticisi'nde npm çalıştıran
+   `node.exe` ve komut satırında `npm-install-job.ps1` geçen bir `powershell.exe` olup olmadığına bakın.
+3. Ardından dosyayı yeniden adlandırın (bir kopya kalır) ve `ocx update` komutunu yeniden çalıştırın:
+
+   ```bat
+   ren "%USERPROFILE%\.opencodex\update-orchestrated.json" update-orchestrated.json.stale
+   ```
+
+   ```bash
+   mv -n ~/.opencodex/update-orchestrated.json ~/.opencodex/update-orchestrated.json.stale
+   ```
+
+`OPENCODEX_HOME` başka bir yeri gösteriyorsa hata mesajının yazdığı yolu kullanın. Bu yol bir kabuğun
+genişletebileceği veya yorumlayabileceği karakterler ya da Windows'ta düz ASCII dışında karakterler içeriyorsa hata
+mesajı komut vermeden yalnızca dosyayı adlandırır; dosyayı elle
+yeniden adlandırın. Koruma süresi
+dolmamış ya da kaydedilen süreci hâlâ çalışan bir dosya bu yönergeyi yazdırmaz; bu durumda bekleyin
+veya çalışan güncellemenin bitmesine izin verin.
+
 ## Güncelleme UNSUPERVISED proxy bildiriyorsa
 
 Güncellemeden sonra arka plan servisi yenilenemediğinde güncelleyici önce mevcut
@@ -132,11 +171,12 @@ sürerse tam `ocx update` terminal çıktısı, `npm config get prefix` ve
 ## Masaüstü güncellemesi “Installing update…” aşamasında takılıyorsa
 
 OpenCodex masaüstü uygulamasında **Install update**, uygulamayı değiştirmeden ve
-yeniden başlatmadan önce yükleyiciyi GitHub Releases'ten indirir. Bilinen sürümde
-indirme/kurulum başarısızsa elle indirme ipucu ve o sürümün yayın bağlantısı gösterilir.
+yeniden başlatmadan önce yükleyiciyi GitHub Releases'ten indirir ve imzasını doğrular.
+Pencere, imza doğrulama hatasını, proxy'nin belirlenemediğini veya durdurulamadığını,
+durdurma işleminin zaten sürdüğünü ya da yükleyicinin başarısız olduğunu bildirir.
+Zaman aşımı durumunda yeniden denemeden önce güncelleme durumunu kontrol edin.
 
-“Installing update…” takılır veya zaman aşımına uğrarsa ağınız GitHub yayın
-indirmelerini yavaşlatıyor veya engelliyor olabilir. Hatadaki bağlantıyı kullanın
+Paket indirilemezse ve sürüm biliniyorsa pencere o sürümün bağlantısını gösterir. Bağlantıyı kullanın
 ya da [yayınlar sayfasında](https://github.com/lidge-jun/opencodex/releases) aynı
 sürümü bulup işletim sisteminize ve mimarinize uygun yükleyiciyi indirin.
 Önizleme sürümlerinin ayrı sayfaları vardır; uygulamanın önerdiği sürümü seçin.

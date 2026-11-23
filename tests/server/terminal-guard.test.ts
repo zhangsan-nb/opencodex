@@ -89,6 +89,83 @@ describe("terminal guard", () => {
     expect(analysis.reason).toBe("recent_tool_activity");
   });
 
+  test("passes a completion summary that follows tool results in the same turn", () => {
+    const request = parsed("Create hello.txt containing hi, then reply DONE.");
+    request.context.messages.push(
+      { role: "assistant", content: [{ type: "toolCall", id: "call_1", name: "exec_command", arguments: {} }], timestamp: 2 },
+      { role: "toolResult", toolCallId: "call_1", toolName: "exec_command", content: "exit 0", isError: false, timestamp: 3 },
+    );
+
+    for (const text of ["DONE", "I've updated calc.py and both tests pass.", "已经完成了。"]) {
+      const analysis = analyzeTerminalTurn(request, [{ type: "text_delta", text }, { type: "done" }]);
+      expect(analysis.decision).toBe("pass");
+      expect(analysis.reason).toBe("recent_tool_activity");
+    }
+  });
+
+  test("still continues a plan announcement that stalls after tool results in the same turn", () => {
+    const request = parsed("Fix the failing test in calc.py");
+    request.context.messages.push(
+      { role: "assistant", content: [{ type: "toolCall", id: "call_1", name: "exec_command", arguments: {} }], timestamp: 2 },
+      { role: "toolResult", toolCallId: "call_1", toolName: "exec_command", content: "1 failed", isError: false, timestamp: 3 },
+    );
+
+    for (const text of [
+      "Let me fix the add function next.",
+      "Done with setup. Next I'll run the tests.",
+      "I'm going to run the tests now.",
+      "环境已经准备好了，下一步运行测试。",
+      "我接下来修改 calc.py。",
+    ]) {
+      const analysis = analyzeTerminalTurn(request, [{ type: "text_delta", text }, { type: "done" }]);
+      expect(analysis.decision).toBe("continue");
+      expect(analysis.reason).toBe("suspicious_no_tool");
+    }
+  });
+
+  test("passes a completion summary that suggests a next step to the user after tool results", () => {
+    // A closing summary often hands the user a follow-up. Nudging it re-runs the finished tools.
+    const request = parsed("Fix the failing test in calc.py");
+    request.context.messages.push(
+      { role: "assistant", content: [{ type: "toolCall", id: "call_1", name: "exec_command", arguments: {} }], timestamp: 2 },
+      { role: "toolResult", toolCallId: "call_1", toolName: "exec_command", content: "2 passed", isError: false, timestamp: 3 },
+    );
+
+    for (const text of ["Fixed. Next, you can run the full suite to confirm.", "Done. Next, run `bun test` locally to verify."]) {
+      const analysis = analyzeTerminalTurn(request, [{ type: "text_delta", text }, { type: "done" }]);
+      expect(analysis.decision).toBe("pass");
+      expect(analysis.reason).toBe("recent_tool_activity");
+    }
+  });
+
+  test("continues a completion that follows a stalled plan announcement after tool results", () => {
+    const request = parsed("Fix the failing test in calc.py");
+    request.context.messages.push(
+      { role: "assistant", content: [{ type: "toolCall", id: "call_1", name: "exec_command", arguments: {} }], timestamp: 2 },
+      { role: "toolResult", toolCallId: "call_1", toolName: "exec_command", content: "1 failed", isError: false, timestamp: 3 },
+      { role: "assistant", content: [{ type: "text", text: "Let me edit the file next." }], timestamp: 4 },
+    );
+
+    const analysis = analyzeTerminalTurn(request, [{ type: "text_delta", text: "Done" }, { type: "done" }]);
+
+    expect(analysis.decision).toBe("continue");
+    expect(analysis.reason).toBe("suspicious_no_tool");
+  });
+
+  test("passes a completion when tools ran again after an earlier plan announcement in the same turn", () => {
+    const request = parsed("Fix the failing test in calc.py");
+    request.context.messages.push(
+      { role: "assistant", content: [{ type: "text", text: "Let me edit the file next." }], timestamp: 2 },
+      { role: "assistant", content: [{ type: "toolCall", id: "call_1", name: "exec_command", arguments: {} }], timestamp: 3 },
+      { role: "toolResult", toolCallId: "call_1", toolName: "exec_command", content: "2 passed", isError: false, timestamp: 4 },
+    );
+
+    const analysis = analyzeTerminalTurn(request, [{ type: "text_delta", text: "Done" }, { type: "done" }]);
+
+    expect(analysis.decision).toBe("pass");
+    expect(analysis.reason).toBe("recent_tool_activity");
+  });
+
   test("continues when the last assistant message was a plan-only stop after earlier tools", () => {
     const request = parsed("继续");
     request.context.messages = [
@@ -187,6 +264,127 @@ describe("terminal guard", () => {
     expect(actual.filter(event => event.type === "done")).toHaveLength(1);
     expect(actual.some(event => event.type === "assistant_boundary")).toBe(true);
     expect(actual.at(-1)).toMatchObject({ usage: { inputTokens: 30, outputTokens: 5, totalTokens: 35, providerCredits: 0.05 } });
+  });
+
+  // #8877: every leg re-sends the whole conversation, and clients size their context window from
+  // the terminal's usage, so a caller that meters the hidden legs gets them apart from it.
+  test("hands re-asked legs to onHiddenUsage and keeps only the final leg's usage on the terminal", async () => {
+    const hidden: unknown[] = [];
+    const actual: AdapterEvent[] = [];
+    for await (const event of guardTerminalEventStream({
+      parsed: parsed("请检查这个问题并修复代码"),
+      firstEvents: (async function* () {
+        yield { type: "text_delta", text: "我接下来会修改相关文件。" } as AdapterEvent;
+        yield { type: "done", usage: { inputTokens: 196_436, outputTokens: 12, cacheReadInputTokens: 196_236 } } as AdapterEvent;
+      })(),
+      continuation: () => (async function* () {
+        yield { type: "tool_call_start", id: "call_1", name: "exec_command" } as AdapterEvent;
+        yield { type: "tool_call_end" } as AdapterEvent;
+        yield { type: "done", usage: { inputTokens: 196_480, outputTokens: 20, cacheReadInputTokens: 196_280, rawUsage: { leg: 2 } } } as AdapterEvent;
+      })(),
+      adapterName: "anthropic",
+      onHiddenUsage: usage => hidden.push(usage),
+    })) actual.push(event);
+
+    expect(hidden).toEqual([{ inputTokens: 196_436, outputTokens: 12, cacheReadInputTokens: 196_236 }]);
+    expect(actual.at(-1)).toEqual({
+      type: "done",
+      usage: { inputTokens: 196_480, outputTokens: 20, cacheReadInputTokens: 196_280, rawUsage: { leg: 2 } },
+    });
+  });
+
+  // A final leg cut at max_tokens is rendered as an incomplete terminal, so the client sees the
+  // summed usage there, like an incomplete or error event, and nothing is hidden.
+  test("a final leg stopped at max_tokens keeps the summed usage and hides nothing", async () => {
+    const hidden: unknown[] = [];
+    const actual: AdapterEvent[] = [];
+    for await (const event of guardTerminalEventStream({
+      parsed: parsed("请检查这个问题并修复代码"),
+      firstEvents: (async function* () {
+        yield { type: "text_delta", text: "我接下来会修改相关文件。" } as AdapterEvent;
+        yield { type: "done", usage: { inputTokens: 10, outputTokens: 2 } } as AdapterEvent;
+      })(),
+      continuation: () => (async function* () {
+        yield { type: "text_delta", text: "partial" } as AdapterEvent;
+        yield { type: "done", stopReason: "max_tokens", usage: { inputTokens: 20, outputTokens: 3 } } as AdapterEvent;
+      })(),
+      adapterName: "anthropic",
+      onHiddenUsage: usage => hidden.push(usage),
+    })) actual.push(event);
+
+    expect(hidden).toEqual([]);
+    expect(actual.at(-1)).toMatchObject({ type: "done", stopReason: "max_tokens", usage: { inputTokens: 30, outputTokens: 5 } });
+  });
+
+  test("keeps the hidden legs on the terminal when the final leg reports no usage", async () => {
+    const hidden: unknown[] = [];
+    const actual: AdapterEvent[] = [];
+    for await (const event of guardTerminalEventStream({
+      parsed: parsed("请检查这个问题并修复代码"),
+      firstEvents: (async function* () {
+        yield { type: "text_delta", text: "我接下来会修改相关文件。" } as AdapterEvent;
+        yield { type: "done", usage: { inputTokens: 10, outputTokens: 2 } } as AdapterEvent;
+      })(),
+      continuation: () => (async function* () {
+        yield { type: "tool_call_start", id: "call_1", name: "exec_command" } as AdapterEvent;
+        yield { type: "tool_call_end" } as AdapterEvent;
+        yield { type: "done" } as AdapterEvent;
+      })(),
+      adapterName: "anthropic",
+      onHiddenUsage: usage => hidden.push(usage),
+    })) actual.push(event);
+
+    // Nothing else would meter the first leg, so it stays where the request log reads it.
+    expect(hidden).toEqual([]);
+    expect(actual.at(-1)).toMatchObject({ type: "done", usage: { inputTokens: 10, outputTokens: 2 } });
+  });
+
+  // #8452 credits split the same way as tokens: the caller meters the hidden leg's reading and the
+  // terminal keeps the final leg's, so neither side counts a reading twice.
+  test("onHiddenUsage takes the re-asked leg's credit reading apart from the final leg's", async () => {
+    const hidden: unknown[] = [];
+    const actual: AdapterEvent[] = [];
+    for await (const event of guardTerminalEventStream({
+      parsed: parsed("请检查这个问题并修复代码"),
+      firstEvents: (async function* () {
+        yield { type: "text_delta", text: "我接下来会修改相关文件。" } as AdapterEvent;
+        yield { type: "done", usage: { inputTokens: 10, outputTokens: 2, providerCredits: 0.04 } } as AdapterEvent;
+      })(),
+      continuation: () => (async function* () {
+        yield { type: "tool_call_start", id: "call_1", name: "exec_command" } as AdapterEvent;
+        yield { type: "tool_call_end" } as AdapterEvent;
+        yield { type: "done", usage: { inputTokens: 20, outputTokens: 3, providerCredits: 0.01 } } as AdapterEvent;
+      })(),
+      adapterName: "anthropic",
+      onHiddenUsage: usage => hidden.push(usage),
+    })) actual.push(event);
+
+    expect(hidden).toEqual([{ inputTokens: 10, outputTokens: 2, providerCredits: 0.04 }]);
+    expect(actual.at(-1)).toEqual({ type: "done", usage: { inputTokens: 20, outputTokens: 3, providerCredits: 0.01 } });
+  });
+
+  // #8841 refuses a second Chat work announcement. That terminal is an error, so it keeps the
+  // summed usage like any failed terminal and nothing is handed to onHiddenUsage.
+  test("a repeated Chat announcement fails with the summed usage and nothing hidden", async () => {
+    const hidden: unknown[] = [];
+    const actual: AdapterEvent[] = [];
+    for await (const event of guardTerminalEventStream({
+      parsed: parsed("Please fix the file and test it."),
+      firstEvents: (async function* () {
+        yield { type: "text_delta", text: "I'll inspect the file and apply the fix." } as AdapterEvent;
+        yield { type: "done", stopReason: "stop", usage: { inputTokens: 10, outputTokens: 2 } } as AdapterEvent;
+      })(),
+      continuation: () => (async function* () {
+        yield { type: "text_delta", text: "I'll inspect the file and apply the fix." } as AdapterEvent;
+        yield { type: "done", stopReason: "stop", usage: { inputTokens: 20, outputTokens: 3 } } as AdapterEvent;
+      })(),
+      adapterName: "openai-chat",
+      onHiddenUsage: usage => hidden.push(usage),
+    })) actual.push(event);
+
+    expect(hidden).toEqual([]);
+    expect(actual.at(-1)).toMatchObject({ type: "error", code: "terminal_continuation_failed",
+      usage: { inputTokens: 30, outputTokens: 5, totalTokens: 35 } });
   });
 
 
@@ -541,7 +739,8 @@ describe("terminal guard bounded retention", () => {
         })) actual.push(event);
         expect(continuations).toBe(2);
         expect(actual.filter(event => event.type === "assistant_boundary")).toHaveLength(2);
-        expect(actual.filter(event => event.type === "done")).toHaveLength(1);
+        expect(actual.filter(event => event.type === "done")).toHaveLength(adapterName === "openai-chat" ? 0 : 1);
+        if (adapterName === "openai-chat") expect(actual.at(-1)).toMatchObject({ type: "error", code: "terminal_continuation_failed" });
         expect(actual.at(-1)).toMatchObject({ usage: { inputTokens: 30, outputTokens: 6, totalTokens: 36 } });
       });
 
@@ -715,4 +914,16 @@ describe("terminal guard lifecycle and accounting", () => {
       }
     });
   }
+});
+
+
+test.each([[undefined, 3], [2, undefined]])("terminal guard marks missing attempt credits incomplete: %s %s", async (first, second) => {
+  const usage = (credits: number | undefined) => credits === undefined ? undefined : { inputTokens: 1, outputTokens: 1, providerCredits: credits };
+  const actual: AdapterEvent[] = [];
+  for await (const event of guardTerminalEventStream({
+    parsed: parsed("请检查这个问题并修复代码"), adapterName: "anthropic",
+    firstEvents: (async function* () { yield { type: "text_delta", text: "我接下来会修改相关文件。" } as AdapterEvent; yield { type: "done", usage: usage(first) } as AdapterEvent; })(),
+    continuation: () => (async function* () { yield { type: "tool_call_start", id: "call_1", name: "exec_command" } as AdapterEvent; yield { type: "done", usage: usage(second) } as AdapterEvent; })(),
+  })) actual.push(event);
+  expect((actual.at(-1) as Extract<AdapterEvent, { type: "done" }>).usage?.providerCredits).toBe(-1);
 });

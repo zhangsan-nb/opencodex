@@ -6,6 +6,7 @@ import {
   type TranslatorBudget,
 } from "../../lib/translator-budget";
 import { resolveKiroApiRegion, resolveKiroRequestProfile } from "../../oauth/kiro";
+import { withMissingCreditReading } from "../../usage/credit-billing";
 import type {
   AdapterEvent,
   OcxParsedRequest,
@@ -18,10 +19,11 @@ import { safeKiroHttpErrorMessage } from "../kiro-errors";
 import { calibrateKiroEstimate } from "../kiro-calibration";
 import { normalizeKiroImages } from "../kiro-images";
 import type { KiroCompletionMode } from "../kiro-constants";
-import { fetchKiroWithRetry } from "../kiro-retry";
+import { fetchKiroWithRetry, KIRO_FETCH_SEND_LIMIT } from "../kiro-retry";
 import { fingerprint, invocationId, osTag } from "../kiro-wire";
 import { hasTrailingDeliveredFinalAnswer } from "./conversation";
 import { buildKiroPayload } from "./payload";
+import type { KiroStructuredOutputSpec } from "./structured-output";
 import {
   jsonStringSerializedUtf8Bytes,
   parseKiroStream,
@@ -60,6 +62,7 @@ export function createKiroAdapter(provider: OcxProviderConfig): ProviderAdapter 
   let toolNameMap: Map<string, string> | undefined;
   let conversationId: string | undefined;
   let completionMode: KiroCompletionMode = "disabled";
+  let structuredOutput: KiroStructuredOutputSpec | undefined;
   let requestSnapshot: OcxParsedRequest | undefined;
   let firstRequestBodyBytes = 0;
   let requestAbortSignal: AbortSignal | undefined;
@@ -88,6 +91,10 @@ export function createKiroAdapter(provider: OcxProviderConfig): ProviderAdapter 
     requestOnPhysicalSend?.({ ordinal, ...(recovery ? { recovery } : {}) });
   };
 
+  /**
+   * Build the Kiro request for a parsed turn, optionally forcing the completion mode (the bounded
+   * retry passes `text_fallback`), and capture the state the stream parser needs.
+   */
   const build = async (
     parsed: OcxParsedRequest,
     forcedCompletionMode?: KiroCompletionMode,
@@ -96,6 +103,7 @@ export function createKiroAdapter(provider: OcxProviderConfig): ProviderAdapter 
     nameMap: Map<string, string>;
     conversationId: string;
     completionMode: KiroCompletionMode;
+    structuredOutput?: KiroStructuredOutputSpec;
     inputTokens: number;
     contextInputEstimate: number;
   }> => {
@@ -154,6 +162,7 @@ export function createKiroAdapter(provider: OcxProviderConfig): ProviderAdapter 
         region,
         requestedModel: parsed.modelId,
         completionMode: built.completionMode,
+        structuredOutput: built.structuredOutput !== undefined,
         bodyBytes: new TextEncoder().encode(body).length,
         messageCount: kiroPayloadMessages(parsed).length,
         toolCount: parsed.context.tools?.length ?? 0,
@@ -173,6 +182,7 @@ export function createKiroAdapter(provider: OcxProviderConfig): ProviderAdapter 
       nameMap: built.nameMap,
       conversationId: built.conversationId,
       completionMode: built.completionMode,
+      ...(built.structuredOutput ? { structuredOutput: built.structuredOutput } : {}),
       inputTokens: estimateKiroInputTokens(parsed),
       contextInputEstimate,
     };
@@ -183,6 +193,7 @@ export function createKiroAdapter(provider: OcxProviderConfig): ProviderAdapter 
     assistantText,
     _sawReasoning,
     budget,
+    onDispatch,
   ) => {
     if (!requestSnapshot) throw new Error("Kiro completion retry lost its request state");
     if (requestAbortSignal?.aborted) {
@@ -249,9 +260,10 @@ export function createKiroAdapter(provider: OcxProviderConfig): ProviderAdapter 
         // And reported nothing, so the sends it paid for were invisible. Its own first send is
         // the completion retry itself: the first attempt produced progress without a final
         // answer, which is the same recovery class the generic empty-completion guard records.
-        ...(requestOnPhysicalSend
-          ? { onPhysicalSend: (send: KiroPhysicalSend) => forwardPhysicalSend(send, fallbackOrdinalBase, "empty-completion") }
-          : {}),
+        onPhysicalSend: (send: KiroPhysicalSend) => {
+          onDispatch?.();
+          if (requestOnPhysicalSend) forwardPhysicalSend(send, fallbackOrdinalBase, "empty-completion");
+        },
       });
       return {
         response,
@@ -268,8 +280,34 @@ export function createKiroAdapter(provider: OcxProviderConfig): ProviderAdapter 
     }
   };
 
+  async function* parseResponseStream(response: Response, budget: TranslatorBudget): AsyncGenerator<AdapterEvent> {
+    // Only the successful header-time response can provide metering. Capture this before the
+    // parser starts its own fallback, which separately tracks its missing readings.
+    const missingHeaderReading = physicalSendsObserved > 1;
+    for await (const event of parseKiroStream(
+      response,
+      budget,
+      modelId,
+      inputTokens,
+      contextWindow,
+      toolNameMap,
+      conversationId,
+      completionMode,
+      completionMode === "required" ? fallbackFactory : undefined,
+      contextInputEstimate,
+      structuredOutput,
+    )) {
+      if (missingHeaderReading && (event.type === "done" || event.type === "incomplete" || event.type === "error")) {
+        yield { ...event, usage: withMissingCreditReading(event.usage) };
+      } else {
+        yield event;
+      }
+    }
+  }
+
   return {
     name: "kiro",
+    hostedIterationSendLimit: 2 * KIRO_FETCH_SEND_LIMIT, // Initial fetch and one bounded completion retry.
     // A replayed history that already ENDS with a delivered final answer has nothing to ask Kiro.
     // Before this hook the adapter still appended a trailing user turn — a neutral acknowledgement,
     // but structurally still a prompt — and performed a real inference, so the model answered the
@@ -297,6 +335,7 @@ export function createKiroAdapter(provider: OcxProviderConfig): ProviderAdapter 
       toolNameMap = built.nameMap;
       conversationId = built.conversationId;
       completionMode = built.completionMode;
+      structuredOutput = built.structuredOutput;
       // Runtime callbacks belong to the original request, not the retry payload.
       requestSnapshot = structuredClone(Object.fromEntries(
         Object.entries(parsed).filter(([, value]) => typeof value !== "function"),
@@ -306,20 +345,8 @@ export function createKiroAdapter(provider: OcxProviderConfig): ProviderAdapter 
       return built.request;
     },
 
-    parseStream(response: Response, budget: TranslatorBudget): AsyncGenerator<AdapterEvent> {
-      return parseKiroStream(
-        response,
-        budget,
-        modelId,
-        inputTokens,
-        contextWindow,
-        toolNameMap,
-        conversationId,
-        completionMode,
-        completionMode === "required" ? fallbackFactory : undefined,
-        contextInputEstimate,
-      );
-    },
+    /** Parse a streaming Kiro response, with the bounded retry wired to this request. */
+    parseStream: parseResponseStream,
 
     fetchResponse(request: AdapterRequest, ctx?: AdapterFetchContext): Promise<Response> {
       // The normal Responses path supplies cancellation at fetch time rather than build time.
@@ -329,40 +356,29 @@ export function createKiroAdapter(provider: OcxProviderConfig): ProviderAdapter 
       requestExecutor = ctx?.executor;
       requestTimeoutMs = ctx?.timeoutMs;
       if (ctx?.sendBudget) requestSendBudget = ctx.sendBudget;
-      if (ctx?.onPhysicalSend) requestOnPhysicalSend = ctx.onPhysicalSend;
+      requestOnPhysicalSend = ctx?.onPhysicalSend;
       // Reset per fetch call, because `ordinal` is defined within one call and the caller records
       // ordinal 1 of each new attempt itself. The text fallback that follows this attempt then
       // continues THIS attempt's sequence rather than an earlier one's.
       physicalSendsObserved = 0;
-      // Routed through the same forwarder as the fallback so both legs share one ordinal
-      // sequence; a context without an observer is passed through untouched.
-      return fetchKiroWithRetry(request, requestOnPhysicalSend
-        ? { ...ctx, returnRawErrors: true, onPhysicalSend: (send: KiroPhysicalSend) => forwardPhysicalSend(send, 0) }
-        : { ...ctx, returnRawErrors: true });
+      return fetchKiroWithRetry(request, {
+        ...ctx, returnRawErrors: true, onPhysicalSend: send => forwardPhysicalSend(send, 0),
+      });
     },
 
     formatErrorBody(status: number, headers: Headers, payloadText: string): string {
       return safeKiroHttpErrorMessage(status, headers, payloadText);
     },
 
-    // Kiro always returns an event stream, including for non-streaming Responses requests. Drain
-    // the decoder into a budget-owned batch so an upstream stream cannot grow this array without
-    // bound while the caller waits for the complete JSON response.
+    /**
+     * Kiro always returns an event stream, including for non-streaming Responses requests. Drain
+     * the decoder into a budget-owned batch so an upstream stream cannot grow this array without
+     * bound while the caller waits for the complete JSON response.
+     */
     async parseResponse(response: Response, budget: TranslatorBudget): Promise<AdapterEvent[]> {
       const events: AdapterEvent[] = [];
       try {
-        for await (const e of parseKiroStream(
-          response,
-          budget,
-          modelId,
-          inputTokens,
-          contextWindow,
-          toolNameMap,
-          conversationId,
-          completionMode,
-          completionMode === "required" ? fallbackFactory : undefined,
-          contextInputEstimate,
-        )) {
+        for await (const e of parseResponseStream(response, budget)) {
           retainTranslatedEvent(e, budget, events.at(-1));
           events.push(e);
         }

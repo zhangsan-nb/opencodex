@@ -1,5 +1,5 @@
 /** `ocx account` — list and switch provider credentials (issue #180). */
-import { apiKeyQuotaText } from "./account-key-quota";
+import { apiKeyQuotaText, quotaUnknownReasonText } from "./account-key-quota";
 import { redactSecretArgs } from "./secret-args";
 import { emptyAccountNextAction, recoveryAccountLabel } from "./account-next-actions";
 import { loadConfig } from "../config";
@@ -57,13 +57,15 @@ const ACCOUNT_USAGE = `Usage:
   ocx account preserve-signed-in openai [on|off|status] [--apply-to-bound] [--json]
   ocx account priority <provider> <account-id|alias|main> [<-100..100|first|earlier|normal|later|last|reset>] [--json]
   ocx account pause <provider> <account-id|alias|main> [--json]
-  ocx account resume <provider> <account-id|alias|main> [--json]
+  ocx account resume <provider> <account-id|alias|main> [--if-healthy] [--json]
+  ocx account reset-affinity <anthropic|anthropic2> [--json]
   ocx account pause-exhausted <provider> [--json]
-  ocx account strategy <provider> [<quota|round-robin|fill-first|least-loaded|reset-first>] [--json]
+  ocx account strategy <provider> [<quota|round-robin|fill-first|reset-near-weighted|least-loaded|reset-first>] [--json]
   ocx account sticky <provider> [<1-100>] [--json]
   ocx account routes <anthropic|anthropic2> [--file <json-file>|--clear] [--json]
   ocx account remove <provider> <account-or-key-id|alias|main> --yes [--json]
   ocx account clear-cooldown <provider> <account-id|alias|main> [--json]
+  ocx account probe google-antigravity [<account-id|alias>] [--json]
   ocx account add-key <provider> [--label <label>] [--json]
   ocx account import <provider> --format <format> (--file <path>|--stdin) [--json]
   ocx account import-orca --source <orca-data-directory> --registry <orca-data.json> [--apply] [--json]
@@ -122,7 +124,8 @@ function statusText(row: AccountRow): string {
   if (row.paused) parts.push(row.pauseDetails ? `paused(${row.pauseDetails.reason})` : "paused");
   if (row.active) parts.push(row.type === "codex" ? "selected" : "active");
   if (row.needsReauth && !(row.provider === "kiro" && row.skipReason === "needs_reauth")) {
-    parts.push(row.needsReauthReason === "verify_account" ? "needs-reauth(verify)" : "needs-reauth");
+    parts.push(row.needsReauthCause === "tos_violation" ? "needs-reauth(tos)"
+      : row.needsReauthReason === "verify_account" ? "needs-reauth(verify)" : "needs-reauth");
   }
   // A paused Kiro row already says "paused"; repeating it as a skip reason adds nothing.
   if (row.provider === "kiro" && row.autoSelectable === false && !(row.paused && row.skipReason === "paused"))
@@ -150,7 +153,7 @@ function quotaText(row: AccountRow): string {
   if (row.type === "api-key") return apiKeyQuotaText(row);
   if (row.quotaUnavailable) return row.quotaFailure ? `unavailable (${row.quotaFailure})` : "unavailable";
   const quota = row.quota;
-  if (!quota) return "-";
+  if (!quota) return row.quotaUnknownReason ? `UNKNOWN (${quotaUnknownReasonText(row.quotaUnknownReason)})` : "-";
   const parts: string[] = [];
   // Two spellings reach this DTO: the per-account provider probe reports `fiveHourPercent`,
   // while the Codex pool reports the same idea as `shortPercent`.
@@ -160,6 +163,8 @@ function quotaText(row: AccountRow): string {
   // Kiro bills a monthly allowance and reports no shorter window, so without this arm a
   // perfectly healthy Kiro account prints "-" and reads as broken.
   if (typeof quota.monthlyPercent === "number") parts.push(`mo ${Math.round(quota.monthlyPercent)}%`);
+  // #8574: the stored weekly reading follows whichever of two live windows came last; say so.
+  if (row.weeklyQuotaConflicts?.length) parts.push("(weekly windows conflict)");
   return parts.length > 0 ? parts.join(" ") : "-";
 }
 
@@ -487,12 +492,20 @@ export async function cmdAccount(args: string[], deps: AccountDeps = {}): Promis
     // dashboard-only capabilities.
     if (sub === "pause") return await cmdPause(rest, deps, true);
     if (sub === "resume") return await cmdPause(rest, deps, false);
+    if (sub === "reset-affinity") {
+      const { cmdResetAffinity } = await import("./account-affinity-reset");
+      return await cmdResetAffinity(rest, deps);
+    }
     if (sub === "pause-exhausted") return await cmdPauseExhausted(rest, deps);
     if (sub === "strategy") return await cmdStrategy(rest, deps);
     if (sub === "sticky") return await cmdSticky(rest, deps);
     if (sub === "routes") return await cmdRoutes(rest, deps);
     if (sub === "remove") return await cmdRemove(rest, deps);
     if (sub === "clear-cooldown") return await cmdClearCooldown(rest, deps);
+    if (sub === "probe") {
+      const { cmdAccountProbe } = await import("./account-probe");
+      return await cmdAccountProbe(rest, deps);
+    }
     if (sub === "add-key") return await cmdAddKey(rest, deps);
     if (sub === "import") return await cmdImport(rest, deps);
     if (sub === "import-orca") {

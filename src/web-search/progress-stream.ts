@@ -8,6 +8,31 @@ import {
 } from "../lib/translator-budget";
 
 const DEFAULT_POST_TERMINAL_DRAIN_TIMEOUT_MS = 5_000;
+const DEFAULT_CONSUMER_TIMEOUT_MS = 300_000;
+
+/** Feed the SSE stall watchdog during a bounded sidecar await. */
+export async function* withHeartbeats<T>(promise: Promise<T>, signal?: AbortSignal): AsyncGenerator<AdapterEvent, T> {
+  const tracked = promise.then(value => ({ value }));
+  for (;;) {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let wake: () => void;
+    const heartbeat = new Promise<undefined>(resolve => {
+      wake = () => resolve(undefined);
+      timer = setTimeout(wake, 1_000);
+      signal?.addEventListener("abort", wake, { once: true });
+      if (signal?.aborted) wake();
+    });
+    let result: { value: T } | undefined;
+    try { result = await Promise.race([tracked, heartbeat]); }
+    finally {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", wake!);
+    }
+    signal?.throwIfAborted();
+    if (result) return result.value;
+    yield { type: "heartbeat" };
+  }
+}
 
 export class RoutedModelInactivityError extends Error {
   readonly timeoutMs: number;
@@ -26,6 +51,13 @@ export class WebSearchStreamProtocolError extends Error {
   }
 }
 
+export class WebSearchConsumerInactivityError extends Error {
+  constructor(readonly timeoutMs: number) {
+    super(`Web-search consumer did not accept an event within ${timeoutMs}ms`);
+    this.name = "WebSearchConsumerInactivityError";
+  }
+}
+
 /** Opt-in preserves an adapter refusal before it becomes an untyped parser exception. */
 export class WebSearchAdapterEventError extends Error {
   constructor(readonly event: Extract<AdapterEvent, { type: "error" }>, readonly replaySafe: boolean) {
@@ -35,11 +67,14 @@ export class WebSearchAdapterEventError extends Error {
 
 export interface ParseStreamWithProgressOptions {
   preserveAdapterError?: boolean;
+  /** Upstream raw-byte inactivity budget. Zero disables this timer. */
   inactivityTimeoutMs: number;
   translatorBudget: TranslatorBudget;
   signal?: AbortSignal;
   /** Kept configurable for focused tests; production callers should use the 5 second default. */
   postTerminalDrainTimeoutMs?: number;
+  /** Bounds an abandoned downstream consumer separately from upstream byte inactivity. */
+  consumerTimeoutMs?: number;
   /** Receives the usage an adapter `error` event carries before the stream fails on it. */
   onErrorUsage?: (usage: OcxUsage) => void;
 }
@@ -151,16 +186,26 @@ export async function* parseStreamWithProgress(
   parseStream: ParseStream,
   options: ParseStreamWithProgressOptions,
 ): AsyncGenerator<AdapterEvent> {
-  const inactivityTimeoutMs = normalizeTimeout(options.inactivityTimeoutMs, "inactivityTimeoutMs");
+  const inactivityTimeoutMs = options.inactivityTimeoutMs === 0
+    ? 0
+    : normalizeTimeout(options.inactivityTimeoutMs, "inactivityTimeoutMs");
   const postTerminalDrainTimeoutMs = normalizeTimeout(
     options.postTerminalDrainTimeoutMs ?? DEFAULT_POST_TERMINAL_DRAIN_TIMEOUT_MS,
     "postTerminalDrainTimeoutMs",
+  );
+  const consumerTimeoutMs = normalizeTimeout(
+    options.consumerTimeoutMs ?? Math.max(DEFAULT_CONSUMER_TIMEOUT_MS, inactivityTimeoutMs),
+    "consumerTimeoutMs",
   );
   const handoff = new ProgressHandoff();
   const reader = response.body?.getReader();
   if (!reader) throw new WebSearchStreamProtocolError("upstream response has no body");
 
   let inactivityTimer: ReturnType<typeof setTimeout> | undefined;
+  let inactivityRemainingMs = inactivityTimeoutMs;
+  let inactivityArmedAt = 0;
+  let consumerBlocked = false;
+  let terminalSeen = false;
   let tappedController: ReadableStreamDefaultController<Uint8Array> | undefined;
   let settled = false;
   let iterator: AsyncGenerator<AdapterEvent> | undefined;
@@ -210,10 +255,46 @@ export async function* parseStreamWithProgress(
     cancelReader(reason);
   };
 
-  const resetInactivity = (): void => {
-    if (settled) return;
+  // Count only active upstream-wait time; a blocked downstream handoff has its own deadline.
+  const armInactivity = (): void => {
+    if (inactivityTimeoutMs === 0 || settled || consumerBlocked || terminalSeen || inactivityTimer !== undefined) return;
+    if (inactivityRemainingMs <= 0) {
+      fail(new RoutedModelInactivityError(inactivityTimeoutMs));
+      return;
+    }
+    inactivityArmedAt = performance.now();
+    inactivityTimer = setTimeout(() => fail(new RoutedModelInactivityError(inactivityTimeoutMs)), inactivityRemainingMs);
+  };
+
+  const pauseInactivity = (): void => {
+    if (inactivityTimer === undefined) return;
+    inactivityRemainingMs = Math.max(0, inactivityRemainingMs - (performance.now() - inactivityArmedAt));
     clearInactivity();
-    inactivityTimer = setTimeout(() => fail(new RoutedModelInactivityError(inactivityTimeoutMs)), inactivityTimeoutMs);
+    if (inactivityRemainingMs <= 0) fail(new RoutedModelInactivityError(inactivityTimeoutMs));
+  };
+
+  const resetInactivity = (): void => {
+    if (settled || terminalSeen) return;
+    clearInactivity();
+    inactivityRemainingMs = inactivityTimeoutMs;
+    armInactivity();
+  };
+
+  const deliverWithTimeout = async (event: AdapterEvent, suspendInactivity: boolean): Promise<void> => {
+    if (suspendInactivity) {
+      consumerBlocked = true;
+      pauseInactivity();
+    }
+    const timer = setTimeout(() => fail(new WebSearchConsumerInactivityError(consumerTimeoutMs)), consumerTimeoutMs);
+    try {
+      await handoff.deliver(event);
+    } finally {
+      clearTimeout(timer);
+      if (suspendInactivity) {
+        consumerBlocked = false;
+        armInactivity();
+      }
+    }
   };
 
   const onAbort = (): void => fail(options.signal?.reason);
@@ -233,7 +314,11 @@ export async function* parseStreamWithProgress(
             controller.close();
             return;
           }
-          if (result.value.byteLength === 0) continue;
+          if (result.value.byteLength === 0) {
+            // A synchronous empty-chunk producer can otherwise starve the timer in microtasks.
+            await new Promise<void>(resolve => setTimeout(resolve, 0));
+            continue;
+          }
           resetInactivity();
           handoff.offerProgress();
           controller.enqueue(result.value);
@@ -287,7 +372,7 @@ export async function* parseStreamWithProgress(
 
         if (result.done) {
           if (!heldTerminal) throw new WebSearchStreamProtocolError("adapter returned without a terminal event");
-          await handoff.deliver(heldTerminal);
+          await deliverWithTimeout(heldTerminal, false);
           if (!settled) {
             settled = true;
             clearInactivity();
@@ -319,13 +404,14 @@ export async function* parseStreamWithProgress(
         replaySafe &&= event.type === "heartbeat" && event.replayUnsafe !== true;
         if (event.type === "done" || event.type === "incomplete") {
           heldTerminal = event;
+          terminalSeen = true;
           // Response-byte inactivity ends once the adapter has produced a terminal event.
           // From here the separate post-terminal drain guard owns the bounded wait for
           // iterator cleanup, so leaving the inactivity timer armed creates a false timeout.
           clearInactivity();
           continue;
         }
-        await handoff.deliver(event);
+        await deliverWithTimeout(event, true);
       }
     } catch (error) {
       fail(isTranslatorBudgetExceededError(error)

@@ -22,6 +22,11 @@ l'interface contre un proxy déjà actif :
 
 ```bash
 ocx start
+```
+
+Laissez le proxy actif dans ce terminal. Dans un second terminal, lancez le serveur de développement du dashboard :
+
+```bash
 bun run dev:gui
 ```
 
@@ -39,7 +44,7 @@ remplissage automatique. Le tableau de bord lui-même ne conserve le jeton qu'en
 dans `localStorage` ni dans `sessionStorage` ; son enregistrement dépend entièrement du navigateur ou du
 gestionnaire de mots de passe.
 
-**Mémoriser cet appareil** est désactivé par défaut. Sur un tableau de bord HTTPS direct (ou en boucle locale), le serveur échange le jeton administrateur contre un cookie d’appareil HttpOnly, SameSite=Strict et une preuve distincte stockée dans le localStorage de ce site. Le cookie est Secure en HTTPS et limité à l’hôte. Ni le cookie ni la preuve ne sont le jeton administrateur, et aucun ne fonctionne seul. Les cookies sont partagés entre les ports d’un même nom d’hôte ; la preuve, limitée à l’origine, lie l’appareil mémorisé à l’origine de ce tableau de bord. Préférez tout de même un nom d’hôte dédié. Le jeton administrateur n’est jamais écrit dans localStorage ou sessionStorage. Si le stockage du navigateur est indisponible ou ne peut enregistrer la preuve, la mémorisation est signalée comme indisponible.
+**Mémoriser cet appareil** est désactivé par défaut. Sur un tableau de bord HTTPS direct (ou en boucle locale), le serveur échange le jeton administrateur contre un cookie d’appareil HttpOnly, SameSite=Strict et une preuve distincte stockée dans le localStorage de ce site. Le cookie est Secure en HTTPS et limité à l’hôte. Ni le cookie ni la preuve ne sont le jeton administrateur, et aucun ne fonctionne seul. Les cookies sont partagés entre les ports d’un même nom d’hôte ; la preuve, limitée à l’origine, lie l’appareil mémorisé à l’origine de ce tableau de bord. Préférez tout de même un nom d’hôte dédié. Le jeton administrateur n’est jamais écrit dans localStorage ou sessionStorage. Si le stockage du navigateur est indisponible ou ne peut enregistrer la preuve, la mémorisation est signalée comme indisponible. Pour un tableau de bord autonome derrière un proxy inverse qui termine TLS, OpenCodex voit une requête HTTP simple et refuse donc la mémorisation pour cette adresse ; la fenêtre de connexion l’explique et désactive l’option, et la connexion sans mémorisation fonctionne toujours. Un écouteur de gestion Hub de confiance fait exception et peut toujours mémoriser les appareils. Exception : en mode autonome, le réglage `dashboardTrustedProxy` autorise la mémorisation à travers ce seul proxy (origine HTTPS exacte, adresses IP du proxy et en-têtes de confiance ; voir « Remember behind a reverse proxy » dans la version anglaise du guide).
 
 Le fichier privé dashboard-sessions.json conserve les empreintes du cookie, de la preuve, du jeton administrateur et de l’identité du navigateur, l’origine du serveur et une expiration fixe de 30 jours. La relance de l’application Safari reprend une session courte tant que cet appareil reste autorisé. Les sessions mémorisées ne peuvent pas approuver les actions de consentement : étoile GitHub, consommation de crédits de réinitialisation, modification des couches de prompt, connexion Meta Muse, changements de compatibilité du bureau ou validation des quotas. Utilisez une nouvelle session locale ou appairée pour ces actions. Les tableaux de bord relayés, inter-origines ou HTTP distant ne prennent pas en charge la mémorisation. L’expiration, un changement d’identité du navigateur ou la rotation du jeton suivie d’un redémarrage imposent une nouvelle connexion.
 
@@ -55,6 +60,8 @@ force jamais d'actualisation en amont.
 
 - Chaque étiquette affiche la fenêtre signalée prioritaire : d'abord hebdomadaire, puis mensuelle,
   puis 5 heures, puis une fenêtre nommée par le fournisseur ou des crédits prépayés.
+- Les crédits prépayés utilisés à 90 % ou plus deviennent prioritaires si la fenêtre habituelle
+  préférée n'est pas critique. Si elle est aussi critique, elle reste affichée en priorité.
 - Une étiquette passe en ambre à 70 % d'utilisation et en rouge à 90 %.
 - Survolez une étiquette ou donnez-lui le focus au clavier pour voir toutes les fenêtres signalées
   avec leur heure de réinitialisation et l'heure de la lecture. Sur un écran tactile, le premier
@@ -79,6 +86,7 @@ force jamais d'actualisation en amont.
 | **Sécurité au démarrage** | Vérifiez si le routage Codex injecté résiste à un redémarrage, avec des états distincts pour le service et le lanceur intermédiaire, ainsi que les commandes de réparation exactes. |
 | **Zone de notification Windows** | Installez au niveau de l'utilisateur un contrôleur lancé à la connexion pour démarrer, arrêter ou redémarrer le proxy en un clic, ouvrir le tableau de bord et consulter l'état. Ce contrôleur n'est pas un service de redémarrage du proxy. |
 | **Démarrage automatique de Codex** | Autorisez un lanceur intermédiaire Codex déjà installé à exécuter `ocx ensure`. Ce commutateur n'installe ni lanceur ni service d'arrière-plan. |
+| **Télémétrie** | Activez ou désactivez **Partager des statistiques d'utilisation anonymes** et consultez **Aperçu du JSON** dans **Détails du proxy** (`#proxy-telemetry`). Lors du premier lancement ou après une mise à jour sans décision enregistrée, la fenêtre de consentement n'enregistre un choix que lorsque vous cliquez sur **Continuer** (`PUT /api/telemetry`) ; la fermer n'enregistre rien. Voir [Télémétrie et confidentialité](/fr/guides/telemetry/). |
 | **Fournisseurs** | Ajoutez, modifiez, activez, désactivez ou supprimez des fournisseurs, définissez le fournisseur par défaut parmi ceux activés et gérez, lorsqu'ils sont pris en charge, les groupes de comptes OAuth et de clés API. Si le fournisseur par défaut actuel est supprimé, le premier fournisseur activé restant prend sa place ; s'il n'en reste aucun, la suppression est refusée et le fournisseur par défaut actuel est conservé. Les réglages d'un fournisseur peuvent désactiver la découverte dynamique pour les points de terminaison dont le catalogue `/models` est absent, lent ou trop volumineux. Pour les groupes OAuth Claude (Anthropic), chaque compte connecté affiche ses propres barres de limites sur 5 heures et une semaine — l'utilisation est propre à chaque identifiant. En cas d'échec d'une sonde, les dernières barres connues sont conservées et marquées indisponibles jusqu'à la prochaine actualisation réussie. |
 | **Ajouter un fournisseur** | Recherchez dans les préréglages du registre une connexion par compte, un service à clé API, un serveur local ou un point de terminaison personnalisé. |
 | **Authentification Codex** | Ajoutez des comptes ChatGPT/Codex au groupe, sélectionnez le compte de la prochaine session, actualisez les quotas sur 5 h, une semaine et 30 jours, activez ou désactivez le changement automatique selon les quotas, réglez son seuil de 1 à 100 % et configurez le basculement en cas de défaillance transitoire. |
@@ -91,15 +99,23 @@ force jamais d'actualisation en amont.
 
 Les vues Utilisation, Tableau de bord, Fournisseurs, Catalogue des fournisseurs et Clés API signalent les enregistrements exclus, même sans résultat lisible. Les décomptes, les dates et les classements reposent uniquement sur les lignes lisibles. L’enregistrement de l’ordre des modèles par utilisation est refusé si l’historique est incomplet : choisissez un autre ordre ou réparez l’historique avant de réessayer.
 
+### Utilisation par application
+
+La page Utilisation s’ouvre avec **Toutes les applications**, **Tous les appareils** et **30 jours** dans le périmètre d’accès actuel. Vous pouvez restreindre l’application, l’appareil ou la période pendant que la page reste ouverte ; la rouvrir rétablit ces valeurs par défaut.
+
+Avec toutes les applications sélectionnées, la section **Applications** apparaît après Modèles et Fournisseurs. Pour les appareils et la période choisis, elle indique la part du total des jetons, le nombre de jetons, le coût estimé au tarif catalogue de l’API, le nombre de requêtes et celui des requêtes dont l’utilisation a été mesurée, par application. Codex CLI, bureau et IDE sont regroupés sous Codex. Les anciens enregistrements sans attribution client sont **Non classés**, distincts de **Inconnu** et **Autre**. Sélectionner une seule application masque cette répartition. Un proxy qui ne fournit pas cette répartition l’affiche comme indisponible ; une répartition vide indique l’absence d’utilisation par application dans le rapport.
+
 ### Filtrer les requêtes
 
-Le détail d’une requête privilégie la cause d’échec amont enregistrée plutôt qu’un message générique d’erreur du proxy. Le nombre d’envois physiques est toujours affiché lorsqu’il est valide ; une comptabilité absente ou invalide affiche **Unavailable**, et non zéro. **Retries** compte les envois après le premier uniquement lorsqu’une seule tentative entièrement réglée et cohérente est enregistrée. Les tentatives multiples, les comptabilités non résolues ou incohérentes et les normalisations avec perte omettent les retries au lieu d’en inventer. Une cause persistante inconnue revient au titre fondé sur le statut, sans attribution brute.
+Le détail d’une requête privilégie la cause d’échec amont enregistrée plutôt qu’un message générique d’erreur du proxy. Le nombre d’envois physiques est toujours affiché lorsqu’il est valide ; une comptabilité absente ou invalide affiche **Unavailable**, et non zéro. **Retries** compte les envois après le premier uniquement lorsqu’une seule tentative entièrement réglée et cohérente est enregistrée. Les tentatives multiples, les comptabilités non résolues ou incohérentes et les normalisations avec perte omettent les retries au lieu d’en inventer. Une cause persistante inconnue revient au titre fondé sur le statut, sans attribution brute. **Upstream reason** affiche une condition fournisseur classée (par exemple limite de débit atteinte, quota ou crédits épuisés, fenêtre de contexte dépassée, emplacement non pris en charge, vérification du compte requise ou modèle indisponible), et **Failure detail** affiche un texte rédigé par le proxy, comme un délai d’inactivité ou une limite d’octets ; les nouvelles lignes ne conservent pas le texte d’erreur propre au fournisseur. D’anciens fichiers `usage.jsonl` peuvent encore le contenir, mais le tableau de bord l’écarte à la lecture.
 
-Les filtres combinent interface, requêtes interceptées, fournisseur, modèle exact, statut, période, vitesse et identifiant de conversation dans le journal chargé. Les choix incluent les tentatives de repli ; les modèles ignorent la casse et les espaces externes, sans correspondance partielle. Un choix disparu revient à Tous.
+Les journaux réunissent toutes les applications et affichent une pastille client contenant uniquement une icône sur chaque requête, à la place des onglets par application. Les clients reconnus utilisent leur logo SVG ; les clients inconnus ou autres utilisent une icône neutre en forme de point d’interrogation. Les noms des applications restent accessibles aux lecteurs d’écran, sans texte visible. L’absence d’attribution client n’implique ni Codex ni un échec de la requête. La pastille identifie l’application cliente indépendamment du fournisseur et du protocole ; ce n’est pas un filtre d’application.
+
+Les filtres combinent requêtes interceptées, fournisseur, modèle exact, statut, période, vitesse et identifiant de conversation dans le journal chargé. Les choix incluent les tentatives de repli ; les modèles ignorent la casse et les espaces externes, sans correspondance partielle. Un choix disparu revient à Tous.
 
 Les périodes de 15 minutes, une heure et un jour évoluent toutes les 30 secondes dans l’onglet Logs, même sans actualisation automatique. La vitesse mesure les jetons de sortie par seconde sur toute la durée : moins de 15, de 15 à moins de 50, ou au moins 50 ; les valeurs indisponibles sont exclues quand ce filtre est actif. Réussite : 2xx ; erreur : 4xx/5xx.
 
-Le compteur compare les résultats au total chargé ; la réinitialisation restaure toutes les lignes. Aucun résultat diffère d’un journal vide. Flèches et Home/End pilotent le sélecteur d’interface. Aucun historique au-delà du journal chargé n’est interrogé.
+Le compteur compare les résultats au total chargé ; la réinitialisation restaure toutes les lignes. Aucun résultat diffère d’un journal vide. Aucun historique au-delà du journal chargé n’est interrogé.
 
 ### Liens directs vers une section
 
@@ -120,18 +136,33 @@ uniquement si la liste d'autorisation de son fournisseur l'inclut — ou si aucu
 s'il n'est pas désactivé. Activer un modèle réconcilie atomiquement les deux filtres ; **Tout activer** efface
 la liste d'autorisation du fournisseur afin que les modèles découverts ultérieurement soient eux aussi actifs.
 
+L’onglet **Tous** (`#models/overall`) affiche dans une seule liste tous les modèles de tous les
+fournisseurs, dans l’ordre du catalogue, avec un champ de recherche, un filtre **Tous** / **Activés** /
+**Désactivés** et le même commutateur. Les deux onglets lisent le même état et partagent une file
+d’enregistrement : un changement fait dans l’un apparaît aussitôt dans l’autre.
+
+Attendez la confirmation avant de quitter **Modèles** ou de changer de serveur : les modifications
+en file d’attente et non encore envoyées sont abandonnées au départ.
+
 ### Gérer les modèles dans l’espace fournisseur
 
-Dans l’onglet **Modèles** d’un fournisseur, **Supprimer** retire la définition personnalisée
-stockée. Le modèle natif ou découvert sous-jacent peut alors réapparaître ; le nombre de modèles
-peut donc rester identique. **Masquer** change uniquement la visibilité dans le catalogue, sans
-supprimer la définition ni modifier la politique de routage direct. **Gérer la visibilité dans
-Modèles** ouvre la page **Modèles** pour rétablir la visibilité, même si l’onglet du fournisseur
-ne contient plus aucune ligne.
+L’onglet **Modèles** d’un fournisseur liste tous ses modèles, y compris ceux qui sont désactivés,
+chacun avec le même commutateur que la page **Modèles** ; les deux pages lisent et écrivent le même
+état. Un commutateur enregistre immédiatement. Tant que cet enregistrement et le rechargement qui
+suit ne sont pas terminés, les autres commutateurs, **Ajouter** et **Supprimer** attendent : une
+seule modification est en cours à la fois, et choisir un autre fournisseur ne l’annule pas. Quitter
+la page **Fournisseurs** avant la fin peut en revanche annuler la requête ; le chargement suivant
+indique si elle a été enregistrée.
+Désactiver un modèle change uniquement la visibilité dans le catalogue, sans supprimer la définition
+ni modifier la politique de routage direct. **Gérer la visibilité dans Modèles** ouvre la page
+**Modèles**.
 
-**Ajouter** enregistre une définition personnalisée sans effacer un masquage existant ni les
-règles de sélection du fournisseur. Un modèle enregistré peut donc rester masqué. Si le modèle
-est déjà connu, gérez sa visibilité dans **Modèles**. Un enregistrement confirmé reste valable
+**Supprimer** retire la définition personnalisée stockée. Le modèle natif ou découvert sous-jacent
+peut alors réapparaître ; le nombre de modèles peut donc rester identique.
+
+**Ajouter** enregistre une définition personnalisée sans annuler une désactivation existante ni les
+règles de sélection du fournisseur. Un modèle enregistré peut donc rester désactivé ; activez-le avec
+son commutateur. Un enregistrement confirmé reste valable
 même si l’actualisation du catalogue échoue : suivez le message d’actualisation au lieu d’ajouter
 le modèle à nouveau. Si la modification n’est pas confirmée, actualisez l’état des modèles avant
 de réessayer.
@@ -140,6 +171,12 @@ Le compteur du fournisseur indique le nombre d’entrées uniques non désactiv�
 courant renvoyé par le serveur, avant recherche ou limitation de l’affichage. Il ne mesure ni la
 liste d’autorisation ni les résultats de découverte en direct et ne prouve pas l’origine d’une
 entrée. Les badges de sélection et les informations de découverte restent distincts.
+
+Ce compteur apparaît dans la liste des fournisseurs. L’en-tête de l’onglet **Modèles** du
+fournisseur indique plutôt combien de modèles sont activés sur le total : le total compte chaque
+entrée listée, y compris les modèles désactivés, et un modèle est activé selon la même règle que
+sur la page **Modèles** : il n’est pas désactivé, et c’est un modèle natif, son fournisseur n’a pas
+de liste d’autorisation, ou cette liste l’inclut.
 
 ## Sélecteur de délégation et routage des créations de sous-agents
 

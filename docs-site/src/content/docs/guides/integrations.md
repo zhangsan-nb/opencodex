@@ -29,9 +29,11 @@ file, and removes it again. Each client below has its own switch:
 | WorkBuddy AI | `~/.workbuddy-ai/models.json` | JSON | auto reload / new sessions | loopback placeholder |
 | Cline CLI | `~/.cline/data/settings/providers.json` and sibling `models.json` | JSON pair | after stopping and restarting Cline | loopback placeholder |
 | Kilo | first existing `kilo.jsonc`, `kilo.json`, `opencode.jsonc`, `opencode.json`, or `config.json` under `~/.config/kilo` | JSONC | new sessions | `OPENCODEX_KILO_API_KEY` |
-| Command Code | `~/.commandcode/providers.json` (on Windows with the default home: use `HOME ?? USERPROFILE` only if nonblank and Windows-absolute, otherwise `homedir()`; a separately supplied home is preserved; append `.commandcode\providers.json`) | JSON | next launch of Command Code | none — keyless loopback (`apiKey: false`) |
+| Command Code | `~/.commandcode/providers.json` (on Windows with the default home: use `HOME ?? USERPROFILE` only if nonblank and Windows-absolute, otherwise `homedir()`; a separately supplied home is preserved; append `.commandcode\providers.json`) | JSON | next launch of Command Code | none — keyless loopback (`apiKey: false`); the desktop app needs its own sign-in and opencodex never writes `auth.json` |
 | Factory Droid | `~/.factory/settings.json` (`%USERPROFILE%\.factory\settings.json` on Windows) | JSON | immediately via file watching | none — keyless loopback |
 | T3 Code | `$T3CODE_HOME/userdata/settings.json` (default `~/.t3/userdata/settings.json`) | JSON | immediately — T3 Code watches the file | non-secret loopback marker |
+
+From the CLI, `ocx integration client enable|disable --client <id>` changes this machine only, like the dashboard toggle. On a Remote Link Home that uses route intent, the change is recorded as the Home's own decision, so `ocx sync` keeps it, and linked Children keep their defaults. To change what Children inherit, use `ocx route to <client> on|off`. On a Remote Link Child a plain toggle is refused and prints the Home command for that device; use `ocx route to <client> off --local` there to opt that Child out. See [Remote Link](/guides/remote-link/#route-clients-per-device).
 
 ## Gentle Shell
 
@@ -173,7 +175,7 @@ runs your own `claude` binary with `ANTHROPIC_BASE_URL` set to the proxy, the no
 `opencodex-proxy` marker as `ANTHROPIC_AUTH_TOKEN`, an explicitly empty `ANTHROPIC_API_KEY`, and
 `CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST=1` so a `settings.json` env block in your Claude config cannot
 re-point it. Each routed model is a custom model keyed by its opencodex selector
-(`provider/model`), which T3 Code sends verbatim. It appears in T3 Code's model picker under
+(`provider/model`), which T3 Code sends verbatim. A model with an effort ladder declares it, so T3 Code offers its effort control and can start a subagent on it at a chosen effort. It appears in T3 Code's model picker under
 **opencodex**. T3 Code reloads the file on its own, so no restart is needed; catalog changes and
 `ocx sync` refresh the instance.
 
@@ -250,6 +252,7 @@ fragment: Apply and Refresh replace it, Disable removes it, and Restore puts bac
 snapshot. These operations do not change the user's default model or the native
 `deepseek-official` provider.
 The managed DSH integration is currently loopback-only and never writes a real credential.
+With a live proxy, explicit sync and background catalog refresh update an already-connected DSH block.
 
 MiniMax Code follows `MINIMAX_DATA_DIR`, then `MAVIS_DATA_DIR`, before falling
 back to `~/.minimax`. Its managed block owns only `custom_provider.opencodex`.
@@ -264,7 +267,7 @@ Prime Agent follows `PRIME_AGENT_CODING_AGENT_DIR` before falling back to
 disagree about which file is meant. Its managed block owns only
 `providers.opencodex`, so other providers and any `modelOverrides` you have set
 stay untouched. Prime Agent reads `models.json` when a session starts, so start
-a new session after connecting it.
+a new session after connecting it. The generated block sets `compat.supportsDeveloperRole` to `false`, so the agent sends its system prompt as `system`; several OpenAI-compatible upstreams reject `developer` with a 400.
 
 Aside keeps a separate model catalog for each registered profile, including local profiles. OpenCodex lists
 all registered profiles, including local profiles, and can synchronize them together or control
@@ -273,7 +276,7 @@ Aside connection enables all profiles by default; individual exclusions survive 
 
 One caveat specific to Aside: the running app rewrites `models.json` itself, so
 fully quit and reopen Aside after applying, the same way Claude Desktop needs a
-restart. Aside's block is loopback-only and never carries a real credential.
+restart. Aside's block is loopback-only and never carries a real credential. The generated block sets `compat.supportsDeveloperRole` to `false`, so the agent sends its system prompt as `system`; several OpenAI-compatible upstreams reject `developer` with a 400.
 
 The managed Raycast integration supports **macOS and Windows**. Custom Providers
 is a **Raycast Pro** feature: on a free plan the file is still written, but
@@ -479,11 +482,15 @@ though the managed document does not change.
 
 If the file changes after you review it, the write is refused as stale. The dialog replaces the
 old plan with the updated one and asks you to confirm again; it never retries the write
-automatically. If a preview is temporarily unavailable, reload the page normally and start the
-action again.
+automatically. When a preview reports that no model catalog is loaded yet, the dialog stays open and
+offers **Load catalog and retry**: it reads the integration list again — the ordinary load that
+retains the catalog, never a preview that gathers models — and then asks for the plan once more.
 
-Aside uses the same preview and confirmation flow for one selected profile at a time. **Sync all
-profiles** remains a separate bulk action and is not bound to one combined preview.
+Aside uses the same preview and confirmation flow for one selected profile at a time, and a plan
+describes exactly that profile's file. Because one plan cannot describe several independently
+changing files, the Overview card for a conflicted Aside integration opens **Connect → Aside** with
+**Choose profile** rather than a Replace action; replace the block on the profile's own page. **Sync
+all profiles** remains a separate bulk action and is not bound to one combined preview.
 
 ## What to expect, honestly
 
@@ -997,12 +1004,13 @@ then picks the cheapest model from your picker list that reaches the tier:
 - When two or more of the other models have a published score in the role's domain, those models are
   tiered by distinct score values, without requiring a price; equal scores share a tier, and unscored models are left out. Scores come from
   [Artificial Analysis](https://artificialanalysis.ai) when you add your own API key
-  (below). The response's `capability` block names the source it used.
+  (below). Artificial Analysis no longer publishes a Coding or Agentic Index, so every domain is scored by
+  its Intelligence Index. The response's `capability` block names the source it used.
 - Other models with a known price are ranked by price and split evenly across the three tiers. With only
   one or two priced models, the dearest is frontier and the other, if any, is standard.
 - When tiering falls back to price, models with no price and no listed tier are not proposed. List them to include them.
 
-To use Artificial Analysis, create a free API key at [artificialanalysis.ai](https://artificialanalysis.ai/api-reference)
+To use Artificial Analysis, create a free API key at [artificialanalysis.ai](https://artificialanalysis.ai/data-api/docs)
 and set it as a literal, an `${ENV}` reference or a keychain reference:
 
 ```json
@@ -1013,14 +1021,16 @@ and set it as a literal, an `${ENV}` reference or a keychain reference:
 }
 ```
 
-opencodex reads it once per day, which stays inside the free tier's daily request limit. Its terms allow
+opencodex reads the free language model list (`/api/v2/language/models/free`) once per day, one request
+per page, which stays inside the free tier's daily request limit. Its terms allow
 using the data for your own decisions and forbid passing it on, so auto-assign keeps the scores
 internal: the response carries the tier each model got and the attribution, without the scores. If the
 key is absent or the read fails, auto-assign uses configured tiers and prices; `capability.error` reports
 why and the source attribution fields are null. A retired `huggingFace` setting is ignored.
 
-Artificial Analysis refuses HTTP redirects and limits each response body to 16 MiB with a 30-second
-request timeout. Credentials are sent only to its fixed API endpoint.
+Artificial Analysis refuses HTTP redirects, reads at most ten pages and 16 MiB in total, and gives each
+request a 30-second timeout; a longer list counts as a failed read. Credentials are sent only to its
+fixed API endpoint.
 
 Each proposal shows the model, the tier, the reasoning effort, a one-line reason, and what would move
 it up or down. A role the model could not size clearly is shown as not sized, with the reason, and
@@ -1035,6 +1045,11 @@ Apply omits `effort` and leaves any existing effort pin as it was. A null propos
 ocx agent roles suggest
 ocx agent roles suggest --model xai/grok-4.5 --apply
 ```
+
+The CLI's `--apply` accepts up to 50 changed roles in one history batch. A larger operation is
+refused before any role update; preview it and apply individual choices with `ocx agent roles set`.
+An interrupted operation reports confirmed writes and the unconfirmed request, and leaves earlier
+writes applied. See the [CLI apply and recovery contract](/reference/cli/agents/) before retrying.
 
 Under the table, **Change history** lists the newest changes a save, an auto-assign apply or `ocx agent roles set` wrote, newest first, in whole batches and never more than 50, so an Apply all is listed with every role it wrote or not at all, with each role's model and effort before and after. One Apply all is one entry. **Restore** writes the earlier values back through the same save, so a restore is listed too. A save never removes a model pin, so a role that had none keeps its current model and gets only its effort back. The history lives in `integrations/codex-agent-roles.jsonl` under the opencodex config directory, which retains at most 256 KiB and 1000 rows by dropping its oldest whole batches. Compaction targets 128 KiB and preserves a Restore together with its complete source batch when they fit both limits, making room by dropping unrelated older batches; history can still expire as later writes arrive. The writer captures the bounded history before appending so a Restore does not evict its own source at the retention boundary; the omo card's Restore center above tracks only `~/.omo/agent/models.json`. Each change records the Codex home it was made in, and only the current home's changes are listed or restored, so after pointing `CODEX_HOME` elsewhere the list starts empty and a Restore from another home's history is refused. If the history file cannot be read, the section says so in place of the list, and the role table keeps working.
 
@@ -1093,6 +1108,16 @@ whichever one it was written into.
 **The credential form.** The provider is written with `apiKey: false`, the documented
 form for an endpoint that needs no key. A raw string is refused by Command Code, and
 no service-token file is read, referenced, or exported by this integration.
+
+**The desktop app needs its own sign-in.** Command Code Desktop never reads the
+keyless provider form: before it shows a workspace it checks `~/.commandcode/auth.json`
+(or `COMMAND_CODE_API_KEY`) and, finding neither, stops on its sign-in screen. Sign in
+there once — or with `cmd login` — and the app stores its own credential.
+
+opencodex does not write that file. It belongs to Command Code and is shared with real
+logins and every other provider's tokens, so enabling this integration only writes
+`providers.json`; the placeholder is never written to `auth.json`, and Apply, overwrite,
+catalog refresh, and Disable all leave the store byte-for-byte alone.
 
 **Home resolution.** There is no `COMMANDCODE_HOME` override here. The published
 client resolves `HOME ?? USERPROFILE` and then appends `/.commandcode/providers.json`;
@@ -1204,3 +1229,44 @@ OpenCodex refuses those ambiguous settings. It also refuses an
 unsafe target or a row edited since apply. The integration is loopback only and
 never copies provider credentials. Factory documents the [BYOK schema](https://docs.factory.ai/model-independence/byok)
 and [personal settings path](https://docs.factory.ai/droid-cli/settings).
+
+## Antigravity app and agy CLI
+
+Google's Antigravity desktop app (2.15 and newer) and the `agy` CLI (1.2.15 and newer) can run through
+OpenCodex's gateway. Connect from the dashboard, or from a terminal:
+
+```bash
+ocx connect antigravity --model <id>   # desktop app: ~/.antigravity/settings.json
+ocx connect agy                        # agy CLI: a marked shell function in your profiles
+ocx connect antigravity status         # or: ocx connect agy status
+ocx disconnect antigravity             # or: ocx disconnect agy
+```
+
+Use `--model` only with `ocx connect antigravity` to set the desktop app's default model.
+
+Connect records what it replaced. Disconnect puts the original bytes back when the file is unchanged, and
+otherwise reverts only OpenCodex's own entries and keeps your other edits. Antigravity can restore
+settings after JSON keys are reordered and keeps the file and restore record when a managed setting conflicts.
+To resolve an Antigravity conflict, put the managed setting back to the value OpenCodex applied and
+retry. If OpenCodex reports `agy-profile-restore-required`, open the shell profile named in the error.
+Restore the complete `agy` block from a copy, including both marker lines and the function between
+them, then retry disconnect or uninstall. OpenCodex removes the whole block and keeps edits outside
+it. You can also restore the saved original profile, which replaces any later edits. An `agy` profile symlink must resolve
+to another supported profile for the same shell family under your home. Antigravity settings must resolve
+to the exact `~/.antigravity/settings.json` path. Restart Antigravity, or open a new terminal for `agy`,
+to apply a change. During disconnect, `agy` skips profiles without a restore record if they cannot be
+resolved or read. `ocx uninstall` disconnects clients with saved restore records
+before removing configuration. If a client cannot be restored, uninstall stops and keeps its record.
+
+OpenCodex writes a placeholder key, never a real credential, so it refuses to connect when the proxy bind
+requires one. A file with comments or trailing commas is also refused and left untouched. Antigravity reads
+an organization `admin_settings.json` first, then the `AGY_LLM_GATEWAY_*` variables, then the user settings;
+status warns about organization settings and environment overrides it can see. It checks the
+OpenCodex process environment. An override set only in the Antigravity process will not appear.
+On Windows `agy` is untested because Google lists it for macOS and Linux only.
+
+To preserve Gemini JSON, sign in with `ocx login google-antigravity` and turn on **Native Gemini
+passthrough** in the Google Antigravity **Accounts** tab. The JSON setting is
+`protocols.rollout.geminiNativeAntigravity`. This opt-in
+applies to `/v1beta` Gemini generation routed to the canonical `google-antigravity` OAuth
+provider. Other routes use the Chat bridge. See [Native Gemini with Antigravity](/reference/proxy-formats/#native-gemini-with-antigravity).

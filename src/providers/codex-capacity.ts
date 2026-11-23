@@ -4,7 +4,9 @@ export const CODEX_CONFIGURED_CAPACITY_WEIGHTS = {
   plus: 1,
   team: 1,
   business: 1,
-  prolite: 5,
+  // Pro 100 / Pro 500 doubled on 2026-10-29; 10x / 50x Plus (OpenAI staff, 2026-11-08). Display only.
+  prolite: 10,
+  promax: 50,
   // Business Premium has 5x Standard included usage; this is display calibration only (#7440).
   self_serve_business_prolite: 5,
   pro: 20,
@@ -59,6 +61,12 @@ export interface CodexCapacityAccount {
   isMain: boolean;
   active?: boolean;
   plan?: unknown;
+  /**
+   * Explicit capacity weight for providers without a calibrated plan table (Anthropic seats
+   * report no tier). When set it replaces the Codex plan lookup and the account is not counted
+   * as an uncalibrated plan.
+   */
+  weight?: number;
   paused: boolean;
   needsReauth?: boolean;
   quota: CodexCapacityQuota | null;
@@ -227,10 +235,13 @@ export function aggregateCodexPoolCapacity(
   let staleQuotaAccounts = 0;
 
   for (const account of accounts) {
-    const weight = codexCapacityWeight(account.plan);
+    const explicitWeight = typeof account.weight === "number" && Number.isFinite(account.weight) && account.weight > 0
+      ? account.weight
+      : undefined;
+    const weight = explicitWeight ?? codexCapacityWeight(account.plan);
     // Still reported, so the operator can see the estimate is conservative for this seat —
     // but no longer a reason to drop the account from the aggregate (#3155).
-    if (!isCalibratedPlan(account.plan)) unknownPlanAccounts += 1;
+    if (explicitWeight === undefined && !isCalibratedPlan(account.plan)) unknownPlanAccounts += 1;
     if (account.paused) pausedAccounts += 1;
     if (account.needsReauth) reauthAccounts += 1;
     const quota = account.quota;

@@ -1,9 +1,11 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadConfig, saveConfig } from "../../src/config";
 import { handleClaudeMessages } from "../../src/server/claude-messages";
+import { echoRequestedModel } from "../../src/server/messages-native";
+import { MessagesSseFrameContext } from "../../src/lib/messages-sse-error-presentation";
 import { handleResponses } from "../../src/server/responses";
 import type { RequestLogContext } from "../../src/server/request-log";
 import { clearKeyCooldowns, getKeyCooldownUntil } from "../../src/providers/key-failover";
@@ -26,6 +28,42 @@ const output = [
   { type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 2 } },
   { type: "message_stop" },
 ];
+
+test("native Messages model echo copies fragmented frame bytes only linearly", async () => {
+  const encoder = new TextEncoder();
+  const frame = encoder.encode(sse([{ ...output[0]!, message: { ...output[0]!.message, padding: "x".repeat(60 * 1024) + "한🙂" } }]));
+  const tail = encoder.encode(sse(output.slice(1)));
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) {
+      for (let offset = 0; offset < frame.length - 1; offset += 256) {
+        controller.enqueue(frame.subarray(offset, Math.min(offset + 256, frame.length - 1)));
+      }
+      controller.enqueue(frame.subarray(frame.length - 1)); // Second LF alone.
+      controller.enqueue(tail);
+      controller.close();
+    },
+  });
+  const actual: Uint8Array[] = [];
+  const set = Uint8Array.prototype.set;
+  let copied = 0;
+  const spy = spyOn(Uint8Array.prototype, "set").mockImplementation(function (this: Uint8Array, source, offset) {
+    copied += source.length;
+    set.call(this, source, offset);
+  });
+  try {
+    const reader = echoRequestedModel(body, "anth/claude-x", new MessagesSseFrameContext()).getReader();
+    for (;;) {
+      const next = await reader.read();
+      if (next.done) break;
+      actual.push(next.value);
+    }
+  } finally {
+    spy.mockRestore();
+  }
+  const rewritten = encoder.encode(new TextDecoder().decode(frame).replace('"model":"claude-x"', '"model":"anth/claude-x"'));
+  expect(Buffer.concat(actual)).toEqual(Buffer.concat([rewritten, tail]));
+  expect(copied).toBeLessThanOrEqual(frame.length * 4);
+});
 const success = (stream = false) => stream
   ? new Response(sse(output), { headers: { "content-type": "text/event-stream" } })
   : Response.json({ id: "msg_billing_fixture", type: "message", role: "assistant", model: "claude-x",
@@ -316,7 +354,7 @@ for (const lane of ["native", "translated"] as const) describe(`${lane} Anthropi
       ? { Authorization: "Bearer fixture-key-C" } : { "x-api-key": "fixture-key-C" };
     const response = await send(lane, config);
     expect(response.status).toBe(400);
-    expect(await response.text()).toContain(creditMessage);
+    expect(await response.text()).toContain(lane === "native" ? "The provider account has no remaining quota or credits." : creditMessage);
     expect(seen).toHaveLength(1);
     expect(seen[0]!.authorization).toBe(kind === "override" ? "Bearer fixture-key-C" : "Bearer fixture-key-0");
     expect(seen[0]!.apiKey).toBe(kind === "conflict" ? "fixture-key-C" : null);
@@ -344,7 +382,7 @@ for (const lane of ["native", "translated"] as const) describe(`${lane} Anthropi
     config.providers.anth!.headers = { "x-api-key": "fixture-key-C" };
     const response = await send(lane, config);
     expect(response.status).toBe(400);
-    expect(await response.text()).toContain(creditMessage);
+    expect(await response.text()).toContain(lane === "native" ? "The provider account has no remaining quota or credits." : creditMessage);
     expect(seen.map(entry => entry.key)).toEqual(["fixture-key-C"]);
     expect(loadConfig().providers.anth!.apiKey).toBe("fixture-key-0");
     expect(getKeyCooldownUntil("anth", "k0")).toBeNull();
@@ -374,11 +412,11 @@ for (const lane of ["native", "translated"] as const) describe(`${lane} Anthropi
     expect(loadConfig().providers.anth!.apiKey).toBe("fixture-key-0");
   });
 
-  test("exhaustion preserves the last upstream billing body", async () => {
+  test("exhaustion preserves the last billing refusal", async () => {
     const config = fixture(() => refusal());
     const response = await send(lane, config);
     expect(response.status).toBe(400);
-    expect(await response.text()).toContain(creditMessage);
+    expect(await response.text()).toContain(lane === "native" ? "The provider account has no remaining quota or credits." : creditMessage);
     expect(seen.map(entry => entry.key)).toEqual(["fixture-key-0", "fixture-key-1"]);
     expect(getKeyCooldownUntil("anth", "k0")).not.toBeNull();
     expect(getKeyCooldownUntil("anth", "k1")).not.toBeNull();
@@ -388,7 +426,7 @@ for (const lane of ["native", "translated"] as const) describe(`${lane} Anthropi
     const config = fixture(() => refusal(), keys);
     const response = await send(lane, config);
     expect(response.status).toBe(400);
-    expect(await response.text()).toContain(creditMessage);
+    expect(await response.text()).toContain(lane === "native" ? "The provider account has no remaining quota or credits." : creditMessage);
     expect(seen).toHaveLength(1);
     expect(seen[0]!.key).toBe("fixture-key-0");
     expect(loadConfig().providers.anth!.apiKey).toBe("fixture-key-0");
@@ -401,7 +439,7 @@ for (const lane of ["native", "translated"] as const) describe(`${lane} Anthropi
       maxTotalModelSends: 2, baseSendAllowance: 2, finalRecoveryAllowance: 0 }) : undefined;
     const response = await send(lane, config, undefined, budget);
     expect(response.status).toBe(400);
-    expect(await response.text()).toContain(creditMessage);
+    expect(await response.text()).toContain(lane === "native" ? "The provider account has no remaining quota or credits." : creditMessage);
     expect(seen).toHaveLength(lane === "native" ? 4 : 2);
   });
 
@@ -414,7 +452,14 @@ for (const lane of ["native", "translated"] as const) describe(`${lane} Anthropi
       headers: { "content-type": "text/event-stream" },
     }));
     const response = await send(lane, config, undefined, undefined, true);
-    expect(await response.text()).toContain(kind === "text" ? "billing recovered" : "billing_tool");
+    const text = await response.text();
+    if (lane === "translated" && kind === "tool") {
+      expect(response.status).toBe(200);
+      const failed = text.split("\n").filter(line => line.startsWith("data: {")).map(line => JSON.parse(line.slice(6))).find(frame => frame.type === "response.failed");
+      expect(failed).toBeDefined();
+      expect(failed.response.error).toMatchObject({ type: "server_error", code: "upstream_server_error", message: expect.stringContaining("undeclared client tool") });
+      expect(text).not.toContain("billing_tool");
+    } else expect(text).toContain(kind === "text" ? "billing recovered" : "billing_tool");
     expect(seen).toHaveLength(1);
     expect(getKeyCooldownUntil("anth", "k0")).toBeNull();
   });

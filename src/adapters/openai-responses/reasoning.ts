@@ -1,6 +1,7 @@
 import { namespacedToolName, type AdapterEvent, type OcxParsedRequest, type OcxProviderConfig, type OcxUsage, type TierDecision } from "../../types";
 import { catalogModelSupportsReasoningSummaries } from "../../codex/catalog";
-import { OCX_REASONING_PREFIX } from "../../responses/reasoning-envelope";
+import { decodeReasoningEnvelope, OCX_REASONING_PREFIX } from "../../responses/reasoning-envelope";
+import type { TranslatorBudget } from "../../lib/translator-budget";
 import { configuredReasoningEfforts, mapReasoningEffort, modelRecordValue } from "../../reasoning-effort";
 import { isPlainObject } from "./internal";
 
@@ -19,6 +20,23 @@ function hasPlaintextReasoningContent(content: unknown): boolean {
     && typeof part.text === "string"
     && part.text.length > 0
   );
+}
+
+/** Put relabeled bridge output back on the raw channel before applying native replay policy. */
+function restoreRawReasoningChannel(rec: Record<string, unknown>, budget?: TranslatorBudget): Record<string, unknown> {
+  if (typeof rec.encrypted_content !== "string" || !rec.encrypted_content.startsWith(OCX_REASONING_PREFIX)
+    || !Array.isArray(rec.summary) || rec.summary.length === 0) return rec;
+  const envelope = decodeReasoningEnvelope(rec.encrypted_content, budget);
+  if (envelope?.txt === undefined) return rec;
+  // Older bridge output used a txt-only envelope and a single verbatim display part.
+  const [part] = rec.summary;
+  const legacyDisplayCopy = rec.summary.length === 1 && isPlainObject(part)
+    && part.type === "summary_text" && part.text === envelope.txt
+    && Object.keys(envelope).length === 1;
+  if (envelope.rawSummary !== true && !legacyDisplayCopy) return rec;
+  const content = hasPlaintextReasoningContent(rec.content)
+    ? rec.content : [{ type: "reasoning_text", text: envelope.txt }];
+  return { ...rec, summary: [], content };
 }
 
 /**
@@ -64,6 +82,7 @@ export function sanitizeReasoningInputContent(
   body: unknown,
   opts?: {
     preserveRawReasoningContent?: boolean;
+    translatorBudget?: TranslatorBudget;
     dropNullContentChannel?: boolean;
     stripEncryptedContent?: boolean;
     /**
@@ -93,8 +112,9 @@ export function sanitizeReasoningInputContent(
   let blankedPlaintext = false;
   const input = raw.input.map(item => {
     if (!item || typeof item !== "object" || Array.isArray(item)) return item;
-    const rec = item as Record<string, unknown>;
-    if (rec.type !== "reasoning") return item;
+    const original = item as Record<string, unknown>;
+    if (original.type !== "reasoning") return item;
+    const rec = restoreRawReasoningChannel(original, opts?.translatorBudget);
     const hasRawContent = Array.isArray(rec.content) && rec.content.length > 0;
     // ocxr1 envelopes are proxy-minted (Anthropic signatures), not OpenAI encryption — the native
     // backend cannot decrypt them and would reject the request. Strip regardless of content shape.
@@ -174,10 +194,15 @@ export function sanitizeReasoningInputContent(
 
 /** Assistant-authored history items: what DeepSeek merges into one assistant message. */
 function isAssistantTurnItem(item: unknown): boolean {
-  if (!isPlainObject(item) || typeof item.type !== "string") return false;
-  if (item.type === "reasoning") return true;
-  if (item.type === "message") return item.role === "assistant";
-  return item.type.endsWith("_call");
+  if (!isPlainObject(item)) return false;
+  // Responses input accepts the message shorthand without `type`. ZCode sends its assistant
+  // text that way, directly ahead of the same turn's function calls; reading only a typed
+  // `message` would split the turn and place the placeholder backfill after the text, which
+  // DeepSeek refuses with the same reasoning_text 400.
+  const type = typeof item.type === "string" ? item.type : "role" in item ? "message" : undefined;
+  if (type === "reasoning") return true;
+  if (type === "message") return item.role === "assistant";
+  return type?.endsWith("_call") === true;
 }
 
 function isClientToolCallItem(item: unknown): boolean {

@@ -9,13 +9,15 @@ import { clearPoolRotationState } from "../../src/codex/pool-rotation";
 import { clearAccountQuota, setAccountQuotaFromParsed } from "../../src/codex/quota";
 import { clearCodexUpstreamHealth, clearThreadAccountMap, getCodexUpstreamHealth } from "../../src/codex/routing";
 import { clearUpstreamHostHealth } from "../../src/codex/upstream-host-health";
-import { handleResponsesCompact } from "../../src/server/responses/compact";
+import { COMPACT_RESPONSE_MAX_BYTES, handleResponsesCompact } from "../../src/server/responses/compact";
 import {
   createRequestExecutionBudget,
   CODEX_TEXT_GUARDED_BUDGET_POLICY,
+  type RequestExecutionBudget,
   type RequestSendObserver,
 } from "../../src/lib/request-execution-budget";
 import { clearPoolRecoveryState } from "../../src/routing/probe-lease";
+import { configureSharedSpendLedger, DEFAULT_SPEND_RESERVATION_POLICY, sharedSpendLedger } from "../../src/lib/spend-reservation-ledger";
 import type { RequestLogContext } from "../../src/server/request-log";
 import type { OcxConfig } from "../../src/types";
 import { acquireOwnedSpendHome } from "../helpers/owned-spend-home";
@@ -129,7 +131,7 @@ function poolConfig(extra: Partial<OcxConfig> = {}): OcxConfig {
   } as OcxConfig;
 }
 
-async function compact(options: {
+async function compactResponse(options: {
   config?: OcxConfig;
   model?: string;
   budget?: ReturnType<typeof createRequestExecutionBudget>;
@@ -143,8 +145,12 @@ async function compact(options: {
     body: JSON.stringify({ model: options.model ?? "gpt-5.5", input: [{ role: "user", content: "compact this" }] }),
     ...(options.signal ? { signal: options.signal } : {}),
   });
-  const response = await handleResponsesCompact(request, options.config ?? poolConfig(), logCtx, undefined, undefined,
+  return handleResponsesCompact(request, options.config ?? poolConfig(), logCtx, undefined, undefined,
     options.budget ? { sendBudget: options.budget } : undefined);
+}
+
+async function compact(options?: Parameters<typeof compactResponse>[0]) {
+  const response = await compactResponse(options);
   return { response, body: await response.text() };
 }
 
@@ -152,7 +158,210 @@ function failures(accountId: string): number {
   return getCodexUpstreamHealth(accountId)?.consecutiveFailures ?? 0;
 }
 
+test("malformed retained compact input does not poison pooled account health", async () => {
+  const config = poolConfig();
+  const healthBefore = [WORK, OTHER].map(id => getCodexUpstreamHealth(id));
+  upstream(compacted);
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const request = new Request("http://localhost/v1/responses/compact", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "gpt-5.5", input: [{ type: "compaction", encrypted_content: "ocx2:invalid" }] }),
+    });
+    const response = await handleResponsesCompact(request, config, { model: "", provider: "" });
+    expect(response.status).toBe(400);
+    expect(await response.json()).toMatchObject({ error: { type: "invalid_request_error" } });
+    expect(sends).toHaveLength(0);
+    expect([WORK, OTHER].map(id => getCodexUpstreamHealth(id))).toEqual(healthBefore);
+  }
+  const { response } = await compact({ config });
+  expect(response.status).toBe(200);
+  expect(sends).toHaveLength(1);
+  expect(failures(WORK)).toBe(0);
+  expect(failures(OTHER)).toBe(0);
+});
+
+test("malformed retained compact input is rejected before a pooled credential refresh", async () => {
+  // expiresAt inside the 60s refresh skew makes getValidCodexToken refresh, so an
+  // unvalidated envelope would spend a token-refresh fetch before the 400.
+  writeFileSync(join(home, "codex-accounts.json"), JSON.stringify(Object.fromEntries(
+    [WORK, OTHER].map(id => [id, {
+      credential: {
+        accessToken: `${id}-access`,
+        refreshToken: `${id}-grant`,
+        expiresAt: Date.now() + 30_000,
+        chatgptAccountId: `acc-${id}`,
+      },
+      generation: 1,
+      refreshGrantFingerprint: createHash("sha256").update(`codex-refresh-grant:${id}-grant`).digest("hex"),
+    }]),
+  )));
+  let fetchCalls = 0;
+  globalThis.fetch = (async () => {
+    fetchCalls++;
+    return Response.json({ access_token: "refreshed-access", refresh_token: "refreshed-grant", expires_in: 3600 });
+  }) as typeof fetch;
+  const request = new Request("http://localhost/v1/responses/compact", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ model: "gpt-5.5", input: [{ type: "compaction", encrypted_content: "ocx2:invalid" }] }),
+  });
+
+  const response = await handleResponsesCompact(request, poolConfig(), { model: "", provider: "" });
+
+  expect(response.status).toBe(400);
+  expect(await response.json()).toMatchObject({ error: { type: "invalid_request_error" } });
+  expect(fetchCalls).toBe(0);
+});
+
 describe("native compact moves a surviving transient 5xx to one alternate account (#6969)", () => {
+  const oneSendCallerBudget = (): RequestExecutionBudget => ({
+    ...createRequestExecutionBudget(),
+    used: 0,
+    remainingBaseSends(cap) { return Math.max(0, Math.min(cap, 1 - this.used)); },
+    reserveDispatch: () => ({ allowed: false, reason: "total-exhausted" }),
+  });
+
+  test.each([{ label: "without opt-in", attempts: undefined }, { label: "with a three-send opt-in", attempts: 3 }])(
+    "native compact honors a one-send caller budget $label", async ({ attempts }) => {
+      const config = poolConfig();
+      config.providers.openai!.transientRetryOn5xx = attempts === undefined ? undefined : { attempts };
+      const budget = oneSendCallerBudget();
+      upstream(overloaded(), overloaded(), compacted);
+      const { response, body } = await compact({ config, budget });
+      expect(sends).toEqual(["Bearer work-access"]);
+      expect(budget.used).toBe(1);
+      expect(response.status).toBe(503);
+      expect(body).toContain("server_is_overloaded");
+    },
+  );
+
+  test.each(["spendEnforced", "workflowCountObserved"] as const)("native compact refuses opaque caller accounting (%s)", async flag => {
+    const config = poolConfig();
+    config.providers.openai!.transientRetryOn5xx = { attempts: 3 };
+    const budget = { ...oneSendCallerBudget(), [flag]: true };
+    upstream(compacted);
+    const { response, body } = await compact({ config, budget });
+    expect(response.status).toBe(429);
+    expect(body).toContain("request_send_budget_exhausted");
+    expect(sends).toEqual([]);
+    expect(budget.used).toBe(0);
+  });
+
+  test("a configured one-send cap preserves the upstream overload without moving accounts", async () => {
+    const config = poolConfig();
+    config.providers.openai!.transientRetryOn5xx = { attempts: 1 };
+    upstream(overloaded(), compacted);
+    const { response, body } = await compact({ config });
+    expect(response.status).toBe(503);
+    expect(body).toContain("server_is_overloaded");
+    expect(sends).toEqual(["Bearer work-access"]);
+  });
+
+  test.each([429, 404])("a configured one-send cap preserves compact HTTP %i without recovery", async status => {
+    const config = poolConfig();
+    config.providers.openai!.transientRetryOn5xx = { attempts: 1 };
+    upstream(() => Response.json({ error: { message: "Compact refusal" } }, { status }), compacted);
+    const { response, body } = await compact({ config });
+    expect(response.status).toBe(status);
+    expect(body).toContain("Compact refusal");
+    expect(sends).toEqual(["Bearer work-access"]);
+  });
+
+  test("native compact funds an opted-in fourth send on the same account", async () => {
+    const config = poolConfig();
+    config.providers.openai!.transientRetryOn5xx = { attempts: 4 };
+    upstream(overloaded(), overloaded(), overloaded(), compacted);
+    const { response } = await compact({ config });
+    expect(response.status).toBe(200);
+    expect(sends).toEqual(Array(4).fill("Bearer work-access"));
+  });
+
+  test.each([100, 400])("native compact reserves each opted-in send before dispatch with a %i-token ceiling", async ceiling => {
+    configureSharedSpendLedger({ ...DEFAULT_SPEND_RESERVATION_POLICY, pool: { maxTokens: ceiling } });
+    const ledger = sharedSpendLedger();
+    const config = poolConfig({ codexAccounts: [{ id: WORK, label: WORK }] });
+    config.providers.openai!.transientRetryOn5xx = { attempts: 4 };
+    config.providers.openai!.requestPacing = { enabled: true, maxConcurrentRequests: 1 };
+    const logCtx: RequestLogContext = { model: "", provider: "", spendInputEstimateTokens: 100 };
+    upstream(() => {
+      expect(ledger.snapshot("pool", "openai")?.reserved).toBe(100 * sends.length);
+      if (sends.length === 1 && ceiling === 100) {
+        // In-flight retries keep the captured ceiling even after an operator raises it.
+        configureSharedSpendLedger({ ...DEFAULT_SPEND_RESERVATION_POLICY, pool: { maxTokens: 400 } });
+      }
+      return sends.length === 4 ? compacted() : Response.json({
+        error: { type: "server_error", code: "server_is_overloaded", message: `Upstream refusal ${sends.length}` },
+      }, { status: 503 });
+    });
+
+    const { response, body } = await compact({ config, logCtx });
+    expect(sends).toEqual(Array(ceiling / 100).fill("Bearer work-access"));
+    if (ceiling === 100) {
+      expect(response.status).toBe(503);
+      expect(JSON.parse(body).error).toMatchObject({ code: "server_is_overloaded", message: "Upstream refusal 1" });
+    } else {
+      expect(response.status).toBe(200);
+    }
+    logCtx.spendTracker!.settle(undefined);
+    expect(ledger.snapshot("pool", "openai")).toMatchObject({ reserved: 0, unresolved: ceiling });
+  });
+
+  async function compactWithPacingAndSpentRetry(refusal: Answer, stallTimeoutSec?: number) {
+    configureSharedSpendLedger({ ...DEFAULT_SPEND_RESERVATION_POLICY, pool: { maxTokens: 100 } });
+    const config = poolConfig({ codexAccounts: [{ id: WORK, label: WORK }], stallTimeoutSec });
+    config.providers.openai!.transientRetryOn5xx = { attempts: 4 };
+    config.providers.openai!.requestPacing = { enabled: true, maxConcurrentRequests: 1 };
+    const logCtx: RequestLogContext = { model: "", provider: "", spendInputEstimateTokens: 100 };
+    upstream(refusal, compacted);
+    const response = await compactResponse({ config, logCtx });
+    expect(sends).toEqual(["Bearer work-access"]);
+    logCtx.spendTracker!.settle(undefined);
+    return response;
+  }
+
+  test("a spend-denied paced retry retains all 70,080 bytes of the native compact refusal", async () => {
+    const refusal = new Uint8Array(70_080).fill(0x61);
+    refusal.set(new TextEncoder().encode("Upstream compact refusal\n"));
+    refusal[refusal.length - 1] = 0xff;
+    const response = await compactWithPacingAndSpentRetry(() => new Response(refusal, {
+      status: 503, headers: { "content-type": "application/octet-stream" },
+    }));
+    expect(response.status).toBe(503);
+    expect(response.headers.get("content-type")).toBe("application/octet-stream");
+    const delivered = new Uint8Array(await response.arrayBuffer());
+    expect(delivered.byteLength).toBe(refusal.byteLength);
+    expect(delivered).toEqual(refusal);
+  });
+
+  test.each([{ label: "declared", declared: true }, { label: "observed", declared: false }])(
+    "a spend-denied paced retry reports a $label oversized native compact refusal", async ({ declared }) => {
+      const response = await compactWithPacingAndSpentRetry(() => new Response(new ReadableStream({
+        start(controller) {
+          controller.enqueue(new Uint8Array(16 * 1024));
+          if (!declared) controller.enqueue(new Uint8Array(COMPACT_RESPONSE_MAX_BYTES));
+          controller.close();
+        },
+      }), {
+        status: 503,
+        headers: declared ? { "content-length": String(COMPACT_RESPONSE_MAX_BYTES + 1) } : {},
+      }));
+      expect(response.status).toBe(502);
+      expect(await response.json()).toMatchObject({ error: { code: "compact_response_too_large" } });
+    },
+  );
+
+  test("a spend-denied paced retry reports a stalled native compact refusal", async () => {
+    let cancellations = 0;
+    const response = await compactWithPacingAndSpentRetry(() => new Response(new ReadableStream({
+      start(controller) { controller.enqueue(new Uint8Array(16 * 1024)); },
+      cancel() { cancellations++; },
+    }), { status: 503 }), 1);
+    expect(response.status).toBe(504);
+    expect(await response.json()).toMatchObject({ error: { code: "upstream_stall_timeout" } });
+    expect(cancellations).toBe(1);
+  });
+
   test("A's ladder, then B from the final recovery reserve, serves the compact", async () => {
     upstream(overloaded(), overloaded(), overloaded(), compacted);
     const { response } = await compact();
@@ -300,4 +509,106 @@ describe("native compact moves a surviving transient 5xx to one alternate accoun
     expect(response.status).toBe(499);
     expect(failures(WORK)).toBe(1);
   });
+});
+
+test.each([false, true])("caller-owned compact Pool-to-main retry scrubs continuation (affinity=%s)", async enabled => {
+  const { fakeChatGptJwt } = await import("../helpers/agent-task-recovery");
+  const { rememberServingConversationStateIssuer } = await import("../../src/server/responses/account-change-state");
+  const { peekConversationStateIssuer } = await import("../../src/codex/routing/thread-affinity");
+  const bearer = fakeChatGptJwt("caller-test");
+  const headers = new Headers({ authorization: `Bearer ${bearer}`, "content-type": "application/json", "session-id": "test-session", "thread-id": "test-thread" });
+  const config = poolConfig({ codexAccounts: [{ id: WORK, label: WORK }], pausedCodexAccountIds: ["__main__"], codexPool: { requestOwnedAffinity: enabled } });
+  const options = { requestScopedMainCredential: true, modelId: "gpt-5.5", primeCodexPoolQuotas: async () => {} };
+  const first = await authContext.resolveCodexAuthContext(headers, config, "pool", options);
+  const second = await authContext.resolveCodexAuthContext(headers, config, "pool", options);
+  expect(first.affinityDecision?.move).toBe(enabled ? "new_bind" : "unbound");
+  expect(second.affinityDecision?.move).toBe(enabled ? "reused" : "unbound");
+  expect(first.kind).toBe("pool");
+  rememberServingConversationStateIssuer(second);
+  const bodies: Record<string, unknown>[] = [];
+  globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+    sends.push(new Headers(init?.headers).get("authorization"));
+    bodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+    if (sends.length === 1) config.pausedCodexAccountIds = [];
+    return sends.length === 1 ? overloadedOnce() : compacted();
+  }) as typeof fetch;
+  const makeRequest = () => new Request("http://localhost/v1/responses/compact", {
+    method: "POST", headers,
+    body: JSON.stringify({ model: "gpt-5.5", previous_response_id: "opaque-previous", input: [{ role: "user", content: "continue" }] }),
+  });
+  const response = await handleResponsesCompact(makeRequest(), config, { model: "", provider: "" });
+  expect(sends.length).toBe(2);
+  expect(response.status).toBe(200);
+  expect(sends).toEqual(["Bearer work-access", `Bearer ${bearer}`]);
+  expect(bodies[1]?.previous_response_id).toBeUndefined();
+  expect(peekConversationStateIssuer(first.conversationStateKey!)).toBe("__main__");
+  config.pausedCodexAccountIds = ["__main__"];
+  sends = []; bodies.length = 0;
+  globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+    sends.push(new Headers(init?.headers).get("authorization"));
+    bodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+    return compacted();
+  }) as typeof fetch;
+  const next = await handleResponsesCompact(makeRequest(), config, { model: "", provider: "" });
+  expect(next.status).toBe(200);
+  expect(sends).toEqual(["Bearer work-access"]);
+  expect(bodies[0]?.previous_response_id).toBeUndefined();
+});
+
+test("caller-owned compact scrubs Pool to manually pinned main and back", async () => {
+  const { fakeChatGptJwt } = await import("../helpers/agent-task-recovery");
+  const { rememberServingConversationStateIssuer } = await import("../../src/server/responses/account-change-state");
+  const bearer = fakeChatGptJwt("pin-caller");
+  const headers = new Headers({ authorization: `Bearer ${bearer}`, "content-type": "application/json", "session-id": "session", "thread-id": "thread" });
+  const config = poolConfig({ codexAccounts: [{ id: WORK, label: WORK }], pausedCodexAccountIds: ["__main__"], codexPool: { requestOwnedAffinity: true } });
+  const options = { requestScopedMainCredential: true, modelId: "gpt-5.5", primeCodexPoolQuotas: async () => {} };
+  const first = await authContext.resolveCodexAuthContext(headers, config, "pool", options);
+  const second = await authContext.resolveCodexAuthContext(headers, config, "pool", options);
+  expect(first.affinityDecision?.move).toBe("new_bind"); expect(second.affinityDecision?.move).toBe("reused");
+  expect(first.kind).toBe("pool"); rememberServingConversationStateIssuer(second);
+  const { resetCodexRoutingForManualSelection } = await import("../../src/codex/routing/active-account");
+  resetCodexRoutingForManualSelection("__main__");
+  config.activeCodexAccountId = "__main__"; config.activeCodexAccountPinned = "__main__"; config.pausedCodexAccountIds = [];
+  const bodies: Record<string, unknown>[] = [];
+  globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+    bodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+    return compacted();
+  }) as typeof fetch;
+  const request = (input: unknown = [{ role: "user", content: "continue" }]) => new Request("http://localhost/v1/responses/compact", {
+    method: "POST", headers, body: JSON.stringify({ model: "gpt-5.5", previous_response_id: "opaque", input }),
+  });
+  const refusal = await handleResponsesCompact(request([{ role: "user", file_id: "opaque" }]), config, { model: "", provider: "" });
+  expect(refusal.status).toBe(400); expect(bodies).toHaveLength(0);
+  const pinned = await handleResponsesCompact(request(), config, { model: "", provider: "" });
+  expect(pinned.status).toBe(200); expect(bodies[0]?.previous_response_id).toBeUndefined();
+  config.activeCodexAccountId = WORK; config.activeCodexAccountPinned = undefined; config.pausedCodexAccountIds = ["__main__"];
+  const back = await handleResponsesCompact(request(), config, { model: "", provider: "" });
+  expect(back.status).toBe(200); expect(bodies[1]?.previous_response_id).toBeUndefined();
+});
+
+test("caller-owned compact main 429 releases only its conversation binding", async () => {
+  const { fakeChatGptJwt } = await import("../helpers/agent-task-recovery");
+  const { getThreadAffinity } = await import("../../src/codex/routing/thread-affinity");
+  const { getCodexQuotaHealthSnapshot } = await import("../../src/codex/routing");
+  const bearer = fakeChatGptJwt("owned-compact-failure");
+  const headers = new Headers({ authorization: `Bearer ${bearer}`, "content-type": "application/json", "session-id": "s", "thread-id": "t" });
+  const config = poolConfig({ codexAccounts: [{ id: WORK, label: WORK }], pausedCodexAccountIds: [WORK], codexPool: { requestOwnedAffinity: true } });
+  const options = { requestScopedMainCredential: true, modelId: "gpt-5.5", primeCodexPoolQuotas: async () => {} };
+  const first = await authContext.resolveCodexAuthContext(headers, config, "pool", options);
+  const second = await authContext.resolveCodexAuthContext(headers, config, "pool", options);
+  expect(first.kind).toBe("main"); expect(first.affinityDecision?.move).toBe("new_bind");
+  expect(second.affinityDecision?.move).toBe("reused");
+  config.pausedCodexAccountIds = [];
+  let status = 200;
+  globalThis.fetch = (async () => status === 200 ? compacted() : Response.json({ error: { message: "quota exceeded" } }, { status: 429, headers: { "retry-after": "600" } })) as typeof fetch;
+  const makeRequest = () => new Request("http://localhost/v1/responses/compact", { method: "POST", headers, body: JSON.stringify({ model: "gpt-5.5", input: [{ role: "user", content: "continue" }] }) });
+  expect((await handleResponsesCompact(makeRequest(), config, { model: "", provider: "" })).status).toBe(200);
+  expect(getThreadAffinity(first.affinityKey!, "shared")?.accountId).toBe("__main__");
+  status = 429;
+  expect((await handleResponsesCompact(makeRequest(), config, { model: "", provider: "" })).status).toBe(429);
+  expect(getThreadAffinity(first.affinityKey!, "shared")).toBeUndefined();
+  expect(getCodexQuotaHealthSnapshot("__main__", "shared")).toBeNull();
+  const next = await authContext.resolveCodexAuthContext(headers, config, "pool", options);
+  expect(next.affinityDecision?.move).toBe("rebound");
+  expect(next.affinityDecision?.reason).toBe("quota_refusal");
 });

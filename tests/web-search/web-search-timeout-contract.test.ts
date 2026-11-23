@@ -140,7 +140,10 @@ describe("web-search timeout runtime contracts", () => {
     const adapter: ProviderAdapter = {
       name: "erroring-error-body",
       buildRequest: () => ({ url: "https://routed.test/v1", method: "POST", headers: {}, body: "{}" }),
-      fetchResponse: async () => new Response(errorBody, { status: 418 }),
+      fetchResponse: async (_req, ctx) => {
+        ctx?.onPhysicalSend?.({ ordinal: 1 });
+        return new Response(errorBody, { status: 418 });
+      },
       formatErrorBody: () => {
         formatterCalls++;
         return "formatter must not run";
@@ -176,7 +179,10 @@ describe("web-search timeout runtime contracts", () => {
     const adapter: ProviderAdapter = {
       name: "throwing-error-body-reader",
       buildRequest: () => ({ url: "https://routed.test/v1", method: "POST", headers: {}, body: "{}" }),
-      fetchResponse: async () => new Response(errorBody, { status: 418 }),
+      fetchResponse: async (_req, ctx) => {
+        ctx?.onPhysicalSend?.({ ordinal: 1 });
+        return new Response(errorBody, { status: 418 });
+      },
       formatErrorBody: () => {
         formatterCalls++;
         return "formatter must not run";
@@ -233,7 +239,7 @@ describe("web-search timeout runtime contracts", () => {
       status: 504,
       errorCode: "upstream_server_error",
       closeReason: "non_stream",
-      upstreamError: message,
+      failureDetail: { code: "header_timeout", value: connectTimeoutMs },
     });
     expect(entries[0].terminalStatus).toBeUndefined();
   }, 1_000);
@@ -249,7 +255,10 @@ describe("web-search timeout runtime contracts", () => {
     const adapter: ProviderAdapter = {
       name: "silent-body",
       buildRequest: () => ({ url: "https://routed.test/v1", method: "POST", headers: {}, body: "{}" }),
-      fetchResponse: async () => silentResponse(() => { sourceCancels++; }),
+      fetchResponse: async (_req, ctx) => {
+        ctx?.onPhysicalSend?.({ ordinal: 1 });
+        return silentResponse(() => { sourceCancels++; });
+      },
       parseStream: parseBodyThen([{ type: "done" }]),
       async parseResponse() { return [{ type: "done" }]; },
     };
@@ -278,7 +287,7 @@ describe("web-search timeout runtime contracts", () => {
       errorCode: "upstream_server_error",
       terminalStatus: "failed",
       closeReason: "terminal",
-      upstreamError: message,
+      failureDetail: { code: "generation_timeout", value: stallMs },
     });
   }, 1_000);
 
@@ -331,7 +340,7 @@ describe("web-search timeout runtime contracts", () => {
       status: 504,
       terminalStatus: "failed",
       closeReason: "terminal",
-      upstreamError: message,
+      failureDetail: { code: "generation_timeout", value: stallMs },
     });
   }, 1_000);
 
@@ -340,7 +349,10 @@ describe("web-search timeout runtime contracts", () => {
     const adapter: ProviderAdapter = {
       name: "client-cancel",
       buildRequest: () => ({ url: "https://routed.test/v1", method: "POST", headers: {}, body: "{}" }),
-      fetchResponse: async () => silentResponse(() => { sourceCancels++; }),
+      fetchResponse: async (_req, ctx) => {
+        ctx?.onPhysicalSend?.({ ordinal: 1 });
+        return silentResponse(() => { sourceCancels++; });
+      },
       parseStream: parseBodyThen([{ type: "done" }]),
       async parseResponse() { return [{ type: "done" }]; },
     };

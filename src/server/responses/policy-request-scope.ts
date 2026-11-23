@@ -1,7 +1,9 @@
 import { formatErrorResponse } from "../../bridge";
+import { markProxyError } from "../../lib/client-error-body";
 import type { RouteResult } from "../../router";
 import type { RouteDecisionTraceV1 } from "../../routing/trace";
 import { resolveOpenAiVirtualModel } from "../../providers/openai-virtual-models";
+import type { AdapterEvent } from "../../types";
 
 /** Request-owned authorization, separate from the diagnostic trace and each physical attempt. */
 export interface PolicyRequestScope {
@@ -27,18 +29,76 @@ export class PolicyCandidateUnavailableError extends Error {
   }
 }
 
+export class MandatoryToolChoiceUnavailableError extends PolicyCandidateUnavailableError {
+  constructor() {
+    super();
+    this.name = "MandatoryToolChoiceUnavailableError";
+  }
+}
+
+export class ComboVisionDescriptionUnavailableError extends PolicyCandidateUnavailableError {}
+
+export function mandatoryToolChoiceUnavailableResponse(): Response {
+  return markProxyError(formatErrorResponse(400, "invalid_request_error",
+    "This mandatory tool_choice cannot be preserved for a translated Chat destination."));
+}
+
 const localRefusals = new WeakSet<Response>();
+const mandatoryToolRefusals = new WeakSet<Response>();
+const visionDescriptionRefusals = new WeakSet<Response>();
+
+/** Attach candidate-local provenance without changing the HTTP envelope. */
+export function markPolicyCandidateRefusal(response: Response): Response {
+  localRefusals.add(response);
+  return response;
+}
+
+/** A mandatory hosted selection cannot be admitted under the credential's spend policy. */
+export class HostedAdvisorSpendRefusal extends Error {
+  constructor(reason: "ceiling" | "ambiguous-credentials" | "credential-binding") {
+    super(reason === "ceiling"
+      ? "The selected hosted Advisor tool is unavailable under the applicable token spend ceiling."
+      : reason === "ambiguous-credentials"
+        ? "The selected hosted Advisor tool is unavailable with ambiguous upstream credentials."
+        : "The selected hosted Advisor tool requires an unambiguous match to the admitted upstream credential.");
+  }
+
+  event(): Extract<AdapterEvent, { type: "error" }> {
+    return { type: "error", status: 400, errorType: "invalid_request_error", message: this.message, retryable: false };
+  }
+
+  response(): Response {
+    return markPolicyCandidateRefusal(markProxyError(formatErrorResponse(400, "invalid_request_error", this.message)));
+  }
+}
 
 export function policyCandidateRefusalResponse(error: unknown): Response | undefined {
   if (!(error instanceof PolicyCandidateUnavailableError)) return undefined;
   const response = formatErrorResponse(409, "policy_candidate_unavailable", error.message);
-  localRefusals.add(response);
-  return response;
+  if (error instanceof MandatoryToolChoiceUnavailableError) mandatoryToolRefusals.add(response);
+  if (error instanceof ComboVisionDescriptionUnavailableError) visionDescriptionRefusals.add(response);
+  return markPolicyCandidateRefusal(response);
 }
 
 /** Upstream text or a matching error code cannot authorize another policy attempt. */
 export function isPolicyCandidateRefusal(response: Response): boolean {
   return localRefusals.has(response);
+}
+
+export function isMandatoryToolChoiceRefusal(response: Response): boolean {
+  return mandatoryToolRefusals.has(response);
+}
+
+export function isComboVisionDescriptionRefusal(response: Response): boolean {
+  return visionDescriptionRefusals.has(response);
+}
+
+/** Preserve local refusal authority when response lifetime owners wrap the body. */
+export function carryPolicyCandidateRefusal(source: Response, target: Response): Response {
+  if (localRefusals.has(source)) localRefusals.add(target);
+  if (mandatoryToolRefusals.has(source)) mandatoryToolRefusals.add(target);
+  if (visionDescriptionRefusals.has(source)) visionDescriptionRefusals.add(target);
+  return target;
 }
 
 export function capturePolicyRequestRoute(scope: PolicyRequestScope, route: RouteResult): RouteResult {

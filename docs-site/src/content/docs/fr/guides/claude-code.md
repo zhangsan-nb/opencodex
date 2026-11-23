@@ -15,8 +15,9 @@ ajouter un compte). Par défaut, chaque requête utilise uniquement le compte **
 Un groupe de comptes Claude **expérimental et facultatif** (`anthropicAccountPool.enabled`) ajoute l'affinité de
 session et la sélection des nouvelles sessions basée sur l'usage entre ces comptes OAuth. Il ne contrôle **pas** le basculement sur 429 : dès que deux comptes utilisables sont enregistrés, une requête limitée bascule vers un autre compte que l'option soit activée ou non, et cela ne peut pas être désactivé. Pour les **nouvelles**
 sessions uniquement, `anthropicAccountPool.strategy` sélectionne un compte éligible : `quota` (par défaut)
-choisit la plus faible utilisation connue dans la fenêtre configurée par `anthropicAccountPool.quotaWindow`
-(`five-hour` par défaut, `weekly` ou `max-utilization`) lorsqu'elle dépasse `autoSwitchThreshold` ; `round-robin`
+conserve le compte actif jusqu'à ce que son utilisation dans la fenêtre définie par
+`anthropicAccountPool.quotaWindow` (`five-hour` par défaut, `weekly` ou `max-utilization`) atteigne
+`autoSwitchThreshold` (80 par défaut), puis passe au compte le moins utilisé, en privilégiant les comptes encore sous leur propre seuil ; `round-robin`
 répartit les sessions uniformément (`stickyLimit`, `1` par défaut) ; `fill-first` utilise le compte actif jusqu'à
 un délai de récupération, une réauthentification ou le seuil, puis passe au suivant. Cette fonction est
 **désactivée par défaut** et reste expérimentale.
@@ -61,10 +62,10 @@ ocx claude
 | `CLAUDE_CODE_AUTO_COMPACT_WINDOW` | Seuil de compactage du contexte automatique (par défaut `829800`) ; injecté uniquement lorsque le contexte automatique est activé |
 | `ANTHROPIC_MODEL` | `claudeCode.model` (facultatif) |
 | `ANTHROPIC_DEFAULT_HAIKU_MODEL` | `claudeCode.tierModels.haiku ?? claudeCode.smallFastModel` (facultatif ; ancien `ANTHROPIC_SMALL_FAST_MODEL` également) |
-| `ANTHROPIC_DEFAULT_{OPUS,SONNET,FABLE}_MODEL` | `claudeCode.tierModels.*` ; lors d'un lancement par abonnement, si non défini, `claude-opus-5-5[1m]` / `claude-sonnet-5-5[1m]` / `claude-fable-5-1[1m]` natif |
+| `ANTHROPIC_DEFAULT_{OPUS,SONNET,FABLE}_MODEL` | `claudeCode.tierModels.*`. Lors d’un lancement local par abonnement, avec `nativePassthrough` activé et le mode de comptabilisation du contexte à 1M (par défaut), chaque emplacement non configuré éligible au marquage automatique reçoit son modèle natif : `claude-opus-5-5[1m]` / `claude-sonnet-5-5[1m]`. Fable utilise `claude-fable-5-2[1m]` avec Claude Code 2.1.290 ou ultérieur, et `claude-fable-5-1[1m]` si la version est antérieure ou inconnue. Régler `claudeCode.contextAccounting` sur `200k` désactive le marquage automatique `[1m]` et laisse vides les emplacements non configurés. Le bloc d’environnement manuel du tableau de bord exporte Fable uniquement si son emplacement est configuré. Sinon, le modèle Fable est choisi par Claude Code dans le terminal où le bloc est collé. |
 | `ANTHROPIC_DEFAULT_{OPUS,SONNET,FABLE,HAIKU}_MODEL_NAME` | Libellé `/model` d'un emplacement de niveau qu'OpenCodex règle sur un alias routé (par exemple `ocx-claude-native--gpt-6.1-sol` → `gpt-6.1-sol (native)`). La même paire est écrite dans l'environnement système launchd et dans le hook shell. L'identifiant du modèle reste l'alias. Un emplacement ou un libellé que vous définissez vous-même n'est pas modifié |
 | `CLAUDE_CODE_ALWAYS_ENABLE_EFFORT` | `1` lorsque `alwaysEnableEffort` est activé (conditionnel) |
-| `ENABLE_TOOL_SEARCH` | `claudeCode.toolSearch` lorsqu'il est défini (conditionnel ; désactivé par défaut) |
+| `ENABLE_TOOL_SEARCH` | `claudeCode.toolSearch` lorsqu'il est défini (conditionnel ; non injecté par défaut, la valeur par défaut de Claude Code s’applique) |
 | `CLAUDE_CODE_MAX_CONTEXT_TOKENS` | Remplacement du contexte hérité lorsque `maxContextTokens` est défini (conditionnel) |
 Les variables que vous exportez vous-même gagnent toujours. Les arguments supplémentaires passent par : `ocx claude -p "hello"`.
 
@@ -169,7 +170,7 @@ unknown signifie qu’opencodex ne peut pas déterminer si les réglages pointen
 
 ### Mode picker : modèles opencodex dans le sélecteur Code first-party
 
-Le mode picker fait partie du mode first-party. Sur macOS et Windows, il est activé par défaut lorsque first-party
+Le mode picker fait partie du mode first-party. Sur macOS, Windows et Linux, il est activé par défaut lorsque first-party
 est sélectionné, sauf si `claudeCode.intercept.picker: false` est défini. Il modifie le sélecteur de
 modèles de l'onglet Code de Desktop first-party pour y afficher les modèles opencodex disponibles par
 leur nom. Lors de la première activation, macOS peut demander l'autorisation d'une autorité de certification
@@ -186,9 +187,7 @@ Une migration unique depuis une ancienne identité peut demander votre consentem
 confiance. Si ce nettoyage échoue, le picker reste indisponible et le profil appliqué utilise un relais
 sans déchiffrement jusqu'à sa réussite. macOS peut aussi demander de déverrouiller le trousseau ou
 d'autoriser l'accès d'une application aux identifiants, y compris après un redémarrage ou une mise à jour. Sur Windows, `on` ou `trust` explicite peut afficher une confirmation d'ajout de la racine.
-Le picker reste non pris en charge sous Linux : aucun travail de CA, de magasin d'identifiants
-ou de proxy picker n'y démarre. L'interception Claude principale reste disponible ; ses fichiers CA locaux
-sont protégés par des vérifications du propriétaire, des liens symboliques, des permissions et des ACL Windows.
+Sous Linux, l'activation explicite du picker utilise `certutil` pour ajouter l'autorité de certification restreinte du picker aux autorités de confiance dans la base NSS de l'utilisateur.
 
 Lorsque le mode picker est actif, Claude Desktop accède au réseau par OpenCodex. Si OpenCodex s'arrête,
 Desktop reste hors ligne jusqu'à son redémarrage complet ou jusqu'à la désactivation du mode picker.
@@ -325,8 +324,21 @@ l'en-tête d'admission dédié du proxy est valide. Par conséquent, l'avertisse
 
 La seule modification du corps concerne les identifiants d'appel d'outil. Un `tool_use.id` ou `tool_result.tool_use_id` qu'Anthropic refuserait (caractères hors de `a-zA-Z0-9_-`, ou plus de 64), par exemple créé plus tôt dans la session par un modèle routé, est réécrit en identifiant conforme sans rompre l'appariement appel/résultat. Les identifiants conformes sont envoyés tels quels, et un identifiant vide reçoit une erreur 400 locale.
 
-Désactivez ce comportement avec `claudeCode.nativePassthrough: false` ; définissez une autre destination avec
-`claudeCode.anthropicBaseUrl`.
+Désactivez ce comportement avec `claudeCode.nativePassthrough: false`,
+`ocx claude config set --native-passthrough off` ou l'interrupteur **Relais Claude natif** sous le
+groupe de comptes Claude dans Providers → Anthropic Claude → Accounts du tableau de bord ; définissez une autre destination avec
+`claudeCode.anthropicBaseUrl`. Les alias d'entrée du sélecteur de modèles Claude et de Claude Desktop sont résolus avant
+`modelMap`. Une entrée `modelMap` dont la clé est un identifiant de modèle brut dirige la demande
+vers le modèle cible chez l'autre fournisseur, que le relais soit activé ou désactivé. Relais
+désactivé, un identifiant brut de modèle Claude sans correspondance passe au routeur. Celui-ci vérifie d'abord
+les alias de politique de routage, puis les alias de combos. Sans correspondance, il examine dans l'ordre un fournisseur activé dont le `defaultModel` est cet identifiant, un
+fournisseur `anthropic` ou `anthropic-*` activé, un fournisseur dont la liste de modèles contient
+l'identifiant, un alias de modèle du fournisseur, puis le fournisseur par défaut. Quand la route est un fournisseur OAuth
+Anthropic, les comptes Anthropic enregistrés dans OpenCodex servent la requête ; un deuxième compte
+enregistré ajoute la bascule sur 429, et le [groupe de comptes OAuth Claude](#groupe-de-comptes-oauth-claude-expérimental) proactif s'applique
+dès que `anthropicAccountPool.enabled` est activé. Le routage suit le réglage dès la requête suivante ;
+relancez les sessions Claude Code déjà ouvertes pour que leurs emplacements de modèle et leurs fenêtres
+de contexte correspondent.
 
 ## Claude Desktop connecté à un hub distant
 
@@ -479,7 +491,15 @@ par défaut, corrige ce comportement :
    atteint au moins le seuil de compactage automatique configuré. Les lignes de découverte et du sélecteur Desktop ne suivent pas
    ce seuil : elles utilisent le plancher fixe de 829 800 jetons (1M réel pour un modèle Claude sur une route Anthropic).
 2. `CLAUDE_CODE_AUTO_COMPACT_WINDOW` (`829800` par défaut, plage `100000`–`1000000`) est injecté afin
-   que la conversation soit automatiquement résumée à ce seuil.
+   que la conversation soit automatiquement résumée à ce seuil. Pour les sessions routées, `ocx claude`
+   peut utiliser `--settings` pour appliquer des seuils par modèle lorsque le catalogue contient des
+   fenêtres plus petites. Si les arguments dépassent la limite du lanceur, la variable reste utilisée.
+
+Le JSON généré relève de la configuration en ligne de commande de Claude Code, au-dessus des fichiers locaux, du projet et de l’utilisateur, et en dessous des paramètres administrés. Passer `--settings <file>` ou `--autocompact` désactive la génération de ce JSON. Le lanceur transmet les arguments `--settings` tels quels et laisse Claude Code lire les fichiers.
+
+Quand l’une de ces options désactive la génération du JSON, le lanceur conserve `CLAUDE_CODE_AUTO_COMPACT_WINDOW` si le contexte automatique la définit. Une valeur exportée explicitement est aussi conservée et désactive la génération du JSON. Dans Claude Code, une valeur valide de cette variable prévaut sur `--autocompact` et les réglages de compactage enregistrés. Pour utiliser les réglages de compactage d’un fichier, définissez `claudeCode.autoContext` sur `false` pour désactiver l’injection automatique, retirez toute valeur exportée de `CLAUDE_CODE_AUTO_COMPACT_WINDOW` et passez `--settings <file>`. Voir [l’ordre de priorité du compactage automatique de Claude Code](https://code.claude.com/docs/en/model-config#set-the-auto-compact-window).
+
+Le lanceur omet les réglages générés et conserve les arguments et l’environnement de lancement d’origine si un argument correspond exactement à une commande ou à un alias de Remote Control (`remote-control`, `rc`, `bridge`, `remote` ou `sync`), y compris une valeur d’option ou un argument après `--`.
 
 Trois états de configuration :
 
@@ -490,9 +510,7 @@ Trois états de configuration :
 La valeur de compactage est réglable dans **Connexion → Claude**. **Avertissement :** une valeur supérieure à la fenêtre réelle d'un modèle
 rend ce modèle inutilisable : les tours échouent avant que le résumé puisse se déclencher.
 
-La normalisation des erreurs de dépassement de contexte utilise uniquement les 65 536 premières unités de code UTF-16 du message du fournisseur.
-Les diagnostics ou nombres de jetons situés après cette limite peuvent disparaître sans marqueur de troncature.
-Consultez le [guide anglais](/guides/claude-code/#auto-context-big-context-models-without-the-200k-ceiling) pour les limites exactes et les conditions de reprise des nombres de jetons.
+La normalisation des réponses d'erreur Messages utilise un texte fixe, sans conserver le texte du fournisseur ni les nombres de jetons. Un dépassement de contexte reconnu renvoie `prompt is too long: The request exceeds the model's context window.`. Dans un flux, un bloc dont le premier champ est l'événement error est conservé jusqu'à 1 Mio ; au-delà, une erreur fixe sans phrase de compaction est renvoyée. Consultez le [guide anglais](/guides/claude-code/#auto-context-big-context-models-without-the-200k-ceiling) pour la portée et les deux exceptions.
 
 Les modèles Anthropic natifs dont le contexte est inférieur à 1M ne sont jamais marqués automatiquement. Une fenêtre de compactage que vous exportez vous-même
 reste prioritaire pour le marquage des variables de lancement ; le proxy s'appuie sur votre valeur pour déterminer les modèles qui peuvent recevoir le marqueur sans risque.
@@ -656,8 +674,8 @@ Le proxy traduit chaque requête Anthropic Messages API au format Codex Response
 
 | Entrée Messages | Sortie Responses |
 | --- | --- |
-| Niveau supérieur `system` | `instructions` (blocs de texte joints par `\n\n`) |
-| `messages[].role: "system"` | Également plié en `instructions` |
+| Niveau supérieur `system` | `instructions` (blocs de texte joints par `\n\n`). Pour GPT-6.2 Sol et Astra via la connexion Codex, envoyé comme premier message `developer` afin d'être mis en cache |
+| `messages[].role: "system"` | Traduits en messages `developer` à leur position d'origine |
 | Texte/image utilisateur | `input_text` / `input_image` (base64 → données URL) |
 | Texte assistant | `output_text` |
 | Assistant `tool_use` | `function_call` (`input` → JSON-stringifié `arguments`) |
@@ -694,7 +712,7 @@ Sur l’adaptateur Anthropic prévu, les blocs signés non masqués (y compris t
 **Taxonomie des erreurs :** 400 `invalid_request_error`, 401 `authentication_error`,
 402 `billing_error`, 403 `permission_error`, 404 `not_found_error`, 409 `conflict_error`,
 413 `request_too_large`, 429 `rate_limit_error`, 504 `timeout_error`, 529 `overloaded_error`,
-autre 5xx `api_error`. `Retry-After` est conservé.
+autre 5xx `api_error`. `Retry-After` est envoyé en secondes entières (une date HTTP devient le nombre de secondes restantes), plafonné à huit jours.
 
 ## Mise en cache des prompts et utilisation des jetons
 
@@ -702,9 +720,9 @@ autre 5xx `api_error`. `Retry-After` est conservé.
 et l'avant-dernier message utilisateur, ainsi que le champ `cache_control` automatique de premier niveau. Les tours stables
 atteignent généralement un taux d'accès au cache d'environ 99.9 %.
 
-**Routage OpenAI/ChatGPT natif :** produit une valeur `prompt_cache_key` propre à la session, à partir de
-`metadata.user_id` lorsqu'il est présent ou, à défaut, d'un hachage du contenu système, ainsi qu'un en-tête `session_id`
-pour l'affinité du cache. La clé de cache inclut le modèle et l'intégralité des schémas d'outils.
+**Routage OpenAI/ChatGPT natif :** produit une valeur `prompt_cache_key`, à partir de
+`metadata.user_id` lorsqu'il s'agit d'une chaîne ou, à défaut, d'un hachage du contenu système, ainsi qu'un en-tête `session_id`
+pour l'affinité du cache, cet en-tête provenant uniquement d'une identité de session et jamais de la clé de repli partagée. La clé de repli dérivée du contenu système (utilisée seulement si un contenu système est présent) inclut aussi le modèle et l'intégralité des schémas d'outils.
 
 **Calcul des jetons d'entrée :** Anthropic soustrait `cached_tokens` et `cache_write_tokens` de
 `input_tokens`, les exposant comme `cache_read_input_tokens` et `cache_creation_input_tokens`.

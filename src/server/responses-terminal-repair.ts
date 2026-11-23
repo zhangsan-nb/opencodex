@@ -1,6 +1,7 @@
+import { rememberProxyIncomplete, carryProxyIncompleteContext } from "../lib/client-error-body";
 import type { TranslatorBudget } from "../lib/translator-budget";
 import type { ResponsesTerminalRepairPolicy } from "../providers/registry";
-import { nextSseBlock, sseDataPayload } from "./sse-payload-rewrite";
+import { createSseBlockBuffer, sseDataPayload } from "./sse-payload-rewrite";
 
 export interface ResponsesTerminalRepairScheduler {
   nowMs(): number;
@@ -80,6 +81,7 @@ export function relayResponsesSseWithTerminalRepair(
   policy: ResponsesTerminalRepairPolicy,
   budget: TranslatorBudget,
   scheduler: ResponsesTerminalRepairScheduler = systemScheduler,
+  proxyErrorContext: object = {},
 ): ReadableStream<Uint8Array> {
   const reader = body.getReader();
   const decoder = new TextDecoder();
@@ -89,8 +91,7 @@ export function relayResponsesSseWithTerminalRepair(
   let created: Record<string, unknown> | null = null;
   let createdBytes = 0;
   let maxSequence = -1;
-  let buffer = "";
-  let bufferBytes = 0;
+  const buffer = createSseBlockBuffer(budget);
   let pendingLineFeed = false;
   let timer: unknown;
   let timerGeneration = 0;
@@ -117,12 +118,6 @@ export function relayResponsesSseWithTerminalRepair(
     created = null;
   };
 
-  const releaseBuffer = (): void => {
-    if (bufferBytes > 0) budget.releaseRetained(bufferBytes, { kind: "live_transient" });
-    buffer = "";
-    bufferBytes = 0;
-  };
-
   const cancelTimer = (): void => {
     timerGeneration += 1;
     if (timer !== undefined) scheduler.cancel(timer);
@@ -135,21 +130,7 @@ export function relayResponsesSseWithTerminalRepair(
     upstream.signal.removeEventListener("abort", onUpstreamAbort);
     cancelTimer();
     releaseRetainedState();
-    releaseBuffer();
-  };
-
-  const replaceBuffer = (next: string): void => {
-    const nextBytes = encoder.encode(next).byteLength;
-    const reservation = budget.reserveTransient(nextBytes, { kind: "live_transient" });
-    reservation.commitRetained();
-    if (bufferBytes > 0) budget.releaseRetained(bufferBytes, { kind: "live_transient" });
-    buffer = next;
-    bufferBytes = nextBytes;
-  };
-
-  const appendBuffer = (fragment: string): void => {
-    if (!fragment) return;
-    replaceBuffer(buffer + fragment);
+    buffer.clear();
   };
 
   const retainCreated = (response: Record<string, unknown>): void => {
@@ -191,6 +172,7 @@ export function relayResponsesSseWithTerminalRepair(
         ? { incomplete_details: { reason: "missing_terminal_event" } }
         : {}),
     };
+    if (kind === "incomplete") rememberProxyIncomplete(proxyErrorContext, "missing_terminal_event");
     const type = `response.${kind}`;
     return encoder.encode(`event: ${type}\ndata: ${JSON.stringify({
       type,
@@ -281,11 +263,10 @@ export function relayResponsesSseWithTerminalRepair(
   const emitBlocks = (
     controller: ReadableStreamDefaultController<Uint8Array>,
   ): { closed: boolean; emitted: boolean } => {
-    let next: ReturnType<typeof nextSseBlock>;
+    let next: ReturnType<typeof buffer.next>;
     let emitted = false;
-    while ((next = nextSseBlock(buffer))) {
-      replaceBuffer(next.rest);
-      pendingLineFeed = next.delimiter.endsWith("\r") && buffer.length === 0;
+    while ((next = buffer.next())) {
+      pendingLineFeed = next.delimiter.endsWith("\r") && buffer.isEmpty();
       const kind = inspectPayload(sseDataPayload(next.block));
       if (kind === "done" && !realTerminalSeen) {
         emitSynthetic(completeCandidate() ? "completed" : "incomplete", controller);
@@ -299,6 +280,7 @@ export function relayResponsesSseWithTerminalRepair(
         return { closed: true, emitted };
       }
     }
+    buffer.compact();
     return { closed: false, emitted };
   };
 
@@ -308,23 +290,23 @@ export function relayResponsesSseWithTerminalRepair(
         const { done, value } = await reader.read();
         if (disposed) return;
         if (done) {
-          appendBuffer(decoder.decode());
-          if (buffer.length > 0) {
+          buffer.append(decoder.decode());
+          if (!buffer.isEmpty()) {
             // A delimiter-less suffix is not a complete SSE event. Preserve an
             // ordinary suffix for passthrough compatibility, but never promote
             // a terminal-like suffix by adding the delimiter it did not receive
             // upstream. The latter must stay tainted and fail closed through the
             // synthetic incomplete terminal below.
             tainted = true;
-            if (!isUnframedTerminalLikeSuffix(buffer)) {
-              controller.enqueue(encoder.encode(buffer));
-              controller.enqueue(encoder.encode(buffer.includes("\r\n") ? "\r\n\r\n" : "\n\n"));
+            const suffix = buffer.tail();
+            if (!isUnframedTerminalLikeSuffix(suffix)) {
+              controller.enqueue(encoder.encode(suffix));
+              controller.enqueue(encoder.encode(suffix.includes("\r\n") ? "\r\n\r\n" : "\n\n"));
             }
           }
           if (!realTerminalSeen) {
             emitSynthetic(completeCandidate() ? "completed" : "incomplete", controller);
           }
-          releaseBuffer();
           dispose();
           controller.close();
           return;
@@ -340,7 +322,7 @@ export function relayResponsesSseWithTerminalRepair(
             continuedDelimiter = true;
           }
         }
-        appendBuffer(fragment);
+        buffer.append(fragment);
         const result = emitBlocks(controller);
         if (result.closed || result.emitted || continuedDelimiter) return;
       }
@@ -351,7 +333,7 @@ export function relayResponsesSseWithTerminalRepair(
     }
   };
 
-  return new ReadableStream<Uint8Array>({
+  return carryProxyIncompleteContext(proxyErrorContext, new ReadableStream<Uint8Array>({
     start(controller) {
       controllerRef = controller;
       if (upstream.signal.aborted) {
@@ -372,5 +354,5 @@ export function relayResponsesSseWithTerminalRepair(
       upstream.abort(reason);
       return reader.cancel(reason);
     },
-  });
+  }));
 }

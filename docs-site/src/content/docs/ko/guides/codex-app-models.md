@@ -250,13 +250,13 @@ Codex가 HTTP로 모델 목록을 불러올 때도 현재 적용 중인 설정�
 
 라우팅 항목에서는 `ultraFastTier`가 `provider/model` 식별자가 정확히 일치하는 저장된 항목에 사용자가
 별도로 넣은 Ultra Fast tier를 보존합니다. 자동 생성된 라우팅 tier는 사용자 제공 tier로
-취급하지 않습니다. bare native `gpt-6-astra` / `gpt-6.1-sol` 항목과 신뢰된 계정별 복제
+취급하지 않습니다. bare native `gpt-6-astra`, `gpt-6.1-sol`, `gpt-6.2-astra`, `gpt-6.2-sol` 항목과 신뢰된 계정별 복제
 항목에서는 `ultraFastTier`를 켜면 네이티브 기본 tier를 바꾸지 않고 누락된 Ultrafast 선택지도
 생성합니다. 끄면 자동 생성한 것으로 추적되는 네이티브 tier 메타데이터만 제거하며,
 사용자가 별도로 넣거나 수정한 네이티브 tier 항목은 보존합니다.
 
-[OpenAI API 문서](https://developers.openai.com/api/docs/guides/ultrafast-mode)는 GPT-6 Astra와
-GPT-6.1 Sol의 Ultrafast 지원을 안내합니다. API 사용 권한과
+[OpenAI 속도 안내](https://learn.chatgpt.com/docs/agent-configuration/speed#ultrafast-mode)는 GPT-6.2 Astra와 Sol,
+GPT-6 Astra와 GPT-6.1 Sol의 Ultrafast 지원을 안내합니다. API 사용 권한과
 [Codex 요금제·워크스페이스 권한](https://learn.chatgpt.com/docs/agent-configuration/speed)은
 별개입니다. 메뉴 표시가 제공자의 사용 권한이나 실측 속도를 보장하지는 않습니다.
 Ultra Fast는 사용량·비용이 더 크며 Codex 자체 기능 제한도 계속 적용됩니다.
@@ -266,9 +266,7 @@ Ultra Fast는 사용량·비용이 더 크며 Codex 자체 기능 제한도 계�
 Codex는 선택기에 보이는 카탈로그 항목을 `priority` 오름차순으로 정렬한 뒤 처음 다섯 개를
 `spawn_agent` model override로 노출합니다. 대시보드 Subagents 페이지에서는 bare native id 또는
 routed `provider/model` id를 최대 다섯 개 선택하고 저장할 수 있습니다. 수동으로 설정한
-`subagentModels`는 account-qualified `<selector>/<native-openai-model>` id도 지원하지만,
-대시보드는 이러한 exact id를 제공하지 않으며 페이지를 저장하면 목록이 대시보드에 표시되는 선택 항목으로
-교체됩니다. opencodex는 선택한 순서대로 낮은 카탈로그 priority를 부여합니다. 계정 한정 선택기 행이
+`subagentModels`는 account-qualified `<selector>/<native-openai-model>` id도 지원합니다. 대시보드는 현재 카탈로그에 없는 모델을 포함하여, 저장된 정확한 id를 목록을 저장할 때도 유지합니다. opencodex는 선택한 순서대로 낮은 카탈로그 priority를 부여합니다. 계정 한정 선택기 행이
 활성화되어 있으면 bare native 선택은 selector-qualified 그룹으로 확장됩니다. 다른 모델도 정확한 id로
 직접 호출할 수 있습니다.
 

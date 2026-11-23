@@ -64,6 +64,7 @@ export interface SettingsData {
     autostartEnabled: boolean;
     shimCoverage: "full" | "cli-only" | "none";
     diagnosticStale: boolean;
+    desktop?: { owned?: boolean; supervisor?: unknown; loginState?: unknown; running?: boolean; viable?: boolean; supervisionUnknown?: boolean };
   };
 }
 export type SidecarBackend = "openai" | "anthropic";
@@ -208,6 +209,7 @@ export function defaultUpdateChannel(version: string | undefined): UpdateChannel
 export function updateReasonLabel(reason: string | undefined, t: (key: TKey) => string): string {
   switch (reason) {
     case "source_checkout": return t("dash.updateReason.source_checkout");
+    case "managed_release": return t("dash.updateReason.managed_release");
     case "latest_unavailable": return t("dash.updateReason.latest_unavailable");
     case "already_latest": return t("dash.updateReason.already_latest");
     case "externally_managed": return t("dash.updateReason.externally_managed");

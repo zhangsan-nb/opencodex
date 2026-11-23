@@ -1,3 +1,6 @@
+import { ADVISOR_SERVER_TOOL_NAME, planAnthropicServerTools } from "../adapters/anthropic/advisor-tool";
+import type { OcxProviderConfig } from "../types";
+import { clientFacingModelLabel } from "../lib/error-destination";
 import {
   AdmissionModelDeniedError, routeAllowedByScope, UNNAMED_DESTINATION_MODEL, type AdmissionModelScope,
 } from "./admission-model-scope";
@@ -58,8 +61,25 @@ export function nativeMessagesToolScopeDenial(
     if (!isAdvisor(tool)) continue;
     const modelId = typeof tool.model === "string" && tool.model.trim() ? tool.model : undefined;
     if (modelId === undefined || !routeAllowedByScope(scope, { providerName, modelId })) {
-      return new AdmissionModelDeniedError(requestedModel, { providerName, modelId: modelId ?? UNNAMED_DESTINATION_MODEL });
+      return new AdmissionModelDeniedError(clientFacingModelLabel(requestedModel), { providerName, modelId: modelId ?? UNNAMED_DESTINATION_MODEL });
     }
   }
   return undefined;
+}
+
+export function scopedAnthropicServerTools(
+  scope: AdmissionModelScope | undefined,
+  route: { providerName: string; modelId: string },
+  tools: readonly Rec[] | undefined,
+): readonly Rec[] | undefined {
+  return tools?.filter(tool => !nativeMessagesToolScopeDenial(scope, route.providerName, route.modelId, { tools: [tool] }));
+}
+
+export function admitsHostedAdvisor(
+  provider: OcxProviderConfig,
+  scopedTools: readonly Rec[] | undefined,
+  functionTools: readonly { name: string }[] | undefined,
+): boolean {
+  return planAnthropicServerTools(provider, scopedTools, undefined, new Set(functionTools?.map(tool => tool.name)), false)
+    .declared.some(tool => tool.name === ADVISOR_SERVER_TOOL_NAME);
 }

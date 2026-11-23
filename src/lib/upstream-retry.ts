@@ -16,6 +16,9 @@
  * the shared abort helpers from here).
  */
 import { clearableDeadline } from "./abort";
+import { isDefiniteContextOverflow } from "./context-overflow-verdict";
+import { errorDestinationLabel, errorDestinationText, type ErrorDestinationLabel } from "./error-destination";
+export { errorDestinationLabel, providerErrorDestinationLabel, errorDestinationText } from "./error-destination";
 import { redactSecretString } from "./redact";
 
 /**
@@ -163,7 +166,7 @@ export function carryReplayRefusal<T extends Response>(source: Response, rewrapp
 }
 
 // 1 initial + 2 retries: the pool may hold more than one stale socket.
-const RESET_RETRY_MAX_ATTEMPTS = 3;
+export const RESET_RETRY_MAX_ATTEMPTS = 3;
 const RESET_RETRY_BASE_DELAY_MS = 150;
 const RESET_RETRY_MAX_DELAY_MS = 1_000;
 
@@ -198,9 +201,9 @@ export function createTransientSendBudget(): TransientSendBudget {
  */
 export class SendBudgetExhaustedError extends Error {
   readonly code = "request_send_budget_exhausted";
-  constructor(label?: string) {
-    super(label
-      ? `request send budget exhausted before dispatch (${label})`
+  constructor(label?: ErrorDestinationLabel) {
+    super(label !== undefined
+      ? `request send budget exhausted before dispatch (${errorDestinationText(label)})`
       : "request send budget exhausted before dispatch");
     this.name = "SendBudgetExhaustedError";
   }
@@ -215,7 +218,7 @@ export class SendBudgetExhaustedError extends Error {
  */
 export class InvalidSendBudgetError extends Error {
   constructor(value: unknown) {
-    super(`invalid upstream send budget: ${String(value)}`);
+    super(`invalid upstream send budget: ${typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : "invalid"}`);
     this.name = "InvalidSendBudgetError";
   }
 }
@@ -246,6 +249,8 @@ export interface RetryBackoffOptions {
   baseDelayMs: number;
   maxDelayMs: number;
   headers?: Headers;
+  /** Delay already validated by the caller, including an explicit zero. */
+  retryAfterMs?: number;
   /**
    * Treat a provider's `Retry-After` as the earliest legal send rather than something the
    * local maximum may shorten. Opt-in per caller so the change lands on the transient path
@@ -405,7 +410,7 @@ export function isConnectionResetError(err: unknown): boolean {
     || msg.includes("connection reset by peer");
 }
 
-function retryAfterDelayMs(headers: Headers): number | undefined {
+export function retryAfterDelayMs(headers: Headers): number | undefined {
   const raw = headers.get("retry-after")?.trim();
   if (!raw) return undefined;
   const seconds = Number(raw);
@@ -416,7 +421,7 @@ function retryAfterDelayMs(headers: Headers): number | undefined {
 }
 
 export function retryBackoffDelayMs(attempt: number, opts: RetryBackoffOptions): number {
-  const retryAfter = opts.headers ? retryAfterDelayMs(opts.headers) : undefined;
+  const retryAfter = opts.retryAfterMs ?? (opts.headers ? retryAfterDelayMs(opts.headers) : undefined);
   const exp = Math.min(opts.baseDelayMs * (2 ** attempt), opts.maxDelayMs);
   const jittered = Math.floor(exp * (0.8 + Math.random() * 0.4));
   if (retryAfter === undefined) return jittered;
@@ -516,8 +521,12 @@ export interface ResetRetryOptions {
   abortSignal?: AbortSignal;
   /** Short host/path label for the retry warn log (no secrets/query strings). */
   label?: string;
+  /** Client error labels are separate from the operational retry-log label. */
+  destination?: ErrorDestinationLabel;
   /** Total upstream sends allowed, including the first one. Not a per-layer retry count. */
   attempts?: number;
+  /** Live shared allowance, also forwarded to nested reset retries. */
+  remainingSends?: () => number;
   /**
    * Reports how many upstream sends this call actually consumed, so a caller that spans
    * several legs of one request (initial send, then a 429/account-recovery refetch) can
@@ -529,9 +538,10 @@ export interface ResetRetryOptions {
    * uncounted but UNCOUNTABLE: the callback existed on a type those call sites never reach.
    */
   onSendsConsumed?: ((sends: number) => void) & {
-    beforeSend?: () => boolean;
+    remaining?: () => number;
+    beforeSend?: (reserveRetrySpend?: boolean) => boolean;
     close?: () => void;
-    execute?: <T>(run: () => Promise<T>) => Promise<T>;
+    execute?: <T>(run: () => Promise<T>, recoveryAdmission?: RetryRecoveryAdmission) => Promise<T>;
   };
   /**
    * Spend one operator-granted replacement for a pre-header reset this helper would otherwise
@@ -547,9 +557,21 @@ export interface ResetRetryOptions {
    * `attempts`, exactly like every other send this leg makes.
    */
   claimAmbiguousResend?: () => boolean;
+  /**
+   * Opt-in offline wait (#7958): asked once a send failed before reaching the origin; true means
+   * the destination is reachable again and one resend may follow inside `attempts`. See
+   * `createOfflineResendWait` in offline-resend.ts, which owns the single-use and pre-connect rules.
+   */
+  offlineWait?: (error: unknown, signal?: AbortSignal) => Promise<boolean>;
 }
 
 export interface TransientRetryOptions extends ResetRetryOptions {
+  /** Require a fresh spend reservation for replacement sends when this ladder is enforcing spend. */
+  reserveRetrySpend?: () => boolean;
+  /** Read the preceding paced response under the receiving path's body policy. */
+  readRetryResponseBody?: PacedRetryBodyReader;
+  /** This leg starts with a recovery send. Keep the preceding response until admission. */
+  retryFrom?: Response;
   /** Test seam: per-attempt slow budget override (defaults to TRANSIENT_RETRY_SLOW_ATTEMPT_MS). */
   slowAttemptMs?: number;
   /**
@@ -563,8 +585,41 @@ export interface TransientRetryOptions extends ResetRetryOptions {
   retryAfterCeilingMs?: number;
 }
 
-export type UpstreamSendRecovery = "connection-reset" | "transient-5xx";
+export type PacedRetryBodyReader = (response: Response, signal?: AbortSignal) => Promise<Uint8Array<ArrayBuffer>>;
+
+type PacedRetryRetention = (signal?: AbortSignal, readBody?: PacedRetryBodyReader) => Promise<Response>;
+const pacedRetryResponses = new WeakMap<Response, PacedRetryRetention>();
+
+/** The pacing owner can materialize its response and return its body lease before a retry. */
+export function registerPacedRetryResponse(response: Response, retain: PacedRetryRetention): void {
+  pacedRetryResponses.set(response, retain);
+}
+
+export function retainPacedRetryResponse(
+  response: Response,
+  signal?: AbortSignal,
+  readBody?: PacedRetryBodyReader,
+): Response | Promise<Response> {
+  return pacedRetryResponses.get(response)?.(signal, readBody) ?? response;
+}
+
+/** `offline-resend` is the single send after an offline wait (#7958), never a reset retry. */
+export type UpstreamSendRecovery = "connection-reset" | "transient-5xx" | "offline-resend";
 type ReplayableFetch = (recovery?: UpstreamSendRecovery) => Promise<Response>;
+
+/** A nested transport recovery must spend a slot in the retry helper that owns the send. */
+export type RetryRecoveryAdmission = {
+  canSend: () => boolean;
+  claim: (admit: () => boolean) => boolean;
+};
+
+function retryRecoveryAdmission(canSend: () => boolean, debit: () => void): RetryRecoveryAdmission {
+  return { canSend, claim(admit) {
+    if (!canSend() || !admit()) return false;
+    debit();
+    return true;
+  } };
+}
 
 /**
  * Rejection thrown by the upstream retry helpers when the terminal attempt
@@ -585,14 +640,13 @@ export class UpstreamRetryEvidenceError extends Error {
     /** True when a connection-reset retry already reached the origin. */
     public readonly resetSeen = false,
   ) {
-    const detail = cause instanceof Error ? cause.message : String(cause);
     const kinds: string[] = [];
     if (transientStatuses.length > 0) kinds.push("transient 5xx response(s)");
     if (resetSeen) kinds.push("a credential-visible connection reset");
     super(
       kinds.length > 0
-        ? `upstream fetch failed after ${kinds.join(" and ")}: ${detail}`
-        : `upstream fetch failed: ${detail}`,
+        ? `upstream fetch failed after ${kinds.join(" and ")}`
+        : "upstream fetch failed",
       { cause },
     );
     this.name = "UpstreamRetryEvidenceError";
@@ -600,20 +654,25 @@ export class UpstreamRetryEvidenceError extends Error {
 }
 
 /**
- * Opt out of Bun's keep-alive pool after a connection-reset retry.
+ * Opt out of Bun's keep-alive pool after a connection-reset retry or an offline resend.
  *
  * Prefer the Bun fetch extension `keepalive: false` (transport-level) over
  * relying on the hop-by-hop `Connection: close` header alone — Bun has ignored
  * that header in past releases (oven-sh/bun#20492), so a header-only retry can
  * still reuse the same half-closed pooled socket. Still set Connection: close
  * as a belt-and-suspenders signal for intermediaries that honor it.
+ *
+ * An offline resend (#7958) follows a DNS outage, typically a sleep or a network change, so any
+ * socket still pooled for that origin or proxy was opened on the network that went away. Reusing
+ * one fails after the body may have left, which turns a provably unsent request into an ambiguous
+ * reset; a fresh connection is what the resend needs anyway.
  */
 export function applyUpstreamRecoveryInit<T extends RequestInit>(
   init: T,
   recovery?: UpstreamSendRecovery,
 ): T & { headers: Headers } {
   const headers = new Headers(init.headers);
-  if (recovery !== "connection-reset") {
+  if (recovery !== "connection-reset" && recovery !== "offline-resend") {
     return { ...init, headers };
   }
   headers.set("connection", "close");
@@ -649,10 +708,11 @@ export async function fetchWithResetRetry(
   firstRecovery?: UpstreamSendRecovery,
 ): Promise<Response> {
   const attempts = normalizeSendAttempts(opts.attempts, RESET_RETRY_MAX_ATTEMPTS);
+  const remainingSends = opts.remainingSends ?? opts.onSendsConsumed?.remaining;
   // Zero is zero. The old Math.max(1, ...) floor meant an exhausted budget still bought one
   // more send on every recovery leg, which is most of what made a bounded per-layer retry
   // compose into an unbounded per-request count.
-  if (attempts === 0) throw new SendBudgetExhaustedError(opts.label);
+  if (attempts === 0) throw new SendBudgetExhaustedError(opts.destination ?? (opts.label ? errorDestinationLabel(opts.label) : undefined));
   try {
   let lastError: unknown;
   let sawReset = false;
@@ -660,49 +720,70 @@ export async function fetchWithResetRetry(
   // settles as the refusal or an unambiguous answer: a second send of a possibly-executed turn
   // is already out, and handing the client anything it would retry compounds it.
   let spentOperatorReplacement = false;
+  // The recovery the next send reports: the caller's for the first, then whichever path resent it.
+  let recovery = firstRecovery;
+  let offlineFailure: { error: unknown } | undefined;
+  const budgetRefusal = () => recovery === "offline-resend" && offlineFailure
+    ? offlineFailure.error
+    : new SendBudgetExhaustedError(opts.destination ?? (opts.label ? errorDestinationLabel(opts.label) : undefined));
   for (let attempt = 0; attempt < attempts; attempt++) {
     if (opts.abortSignal?.aborted) throw abortError(opts.abortSignal);
+    if (remainingSends && remainingSends() <= 0) throw budgetRefusal();
     // Reported before the await, one physical send at a time: a send that rejects has still
     // been made, and this helper leaves through four exits (return, reset give-up, non-reset
     // rethrow, abort), so a per-send report is the only shape that is correct on all of them.
-    if (opts.onSendsConsumed?.beforeSend && !opts.onSendsConsumed.beforeSend()) throw new SendBudgetExhaustedError(opts.label);
+    if (opts.onSendsConsumed?.beforeSend && !opts.onSendsConsumed.beforeSend()) throw budgetRefusal();
     if (!opts.onSendsConsumed?.beforeSend) opts.onSendsConsumed?.(1);
     try {
       let response: Response;
-      try { const run = () => doFetch(attempt === 0 ? firstRecovery : "connection-reset");
-        response = await (opts.onSendsConsumed?.execute ? opts.onSendsConsumed.execute(run) : run()); }
+      try { const sendRecovery = recovery; const run = () => doFetch(sendRecovery);
+        response = await (opts.onSendsConsumed?.execute
+          ? opts.onSendsConsumed.execute(run, retryRecoveryAdmission(() => attempt + 1 < attempts, () => { attempt++; }))
+          : run()); }
       finally { if (opts.onSendsConsumed?.beforeSend) opts.onSendsConsumed(1); }
       return spentOperatorReplacement ? settleOperatorReplacement(response) : response;
     } catch (err) {
+      if (offlineFailure && recovery === "offline-resend" && err instanceof SendBudgetExhaustedError) throw offlineFailure.error;
       if (opts.abortSignal?.aborted) throw err;
       if (!isConnectionResetError(err)) {
         // Whatever ended the leg, an operator replacement already went out, so the first send
         // may have run the turn. Settle it as the refusal instead of throwing into a caller
         // whose transport-failure path answers with a client-retryable 502.
         if (spentOperatorReplacement) return replayRefusalResponse();
+        if (err instanceof SendBudgetExhaustedError) throw err;
         // A reset that already reached the origin is credential-visible
         // evidence: keep it attached so the terminal rejection cannot be
         // downgraded to the pre-connection neutral class (#914 review).
         if (sawReset) throw new UpstreamRetryEvidenceError([], err, true);
+        // Nothing reached the origin, so one resend after reachability returns cannot repeat an effect.
+        // A client that left during the wait gets this failure back, never the abort reason.
+        if (attempt + 1 < attempts && (!remainingSends || remainingSends() > 0)
+          && opts.offlineWait && await opts.offlineWait(err, opts.abortSignal)
+          && !opts.abortSignal?.aborted) {
+          offlineFailure = { error: err };
+          recovery = "offline-resend";
+          continue;
+        }
         throw err;
       }
       if (opts.replaySafe === true) {
         // Repeating this operation cannot duplicate anything, so an exhausted budget rethrows
         // and the caller's own error path takes over.
-        if (attempt === attempts - 1) throw err;
+        if (attempt === attempts - 1 || (remainingSends && remainingSends() <= 0)) throw err;
       } else {
         // The stage table refuses an ambiguous pre-header reset. The only thing that overrides
         // it is an operator allowance, and claiming it here is what keeps the grant single --
         // the post-header protocol gate spends the same counter for the same logical request.
         // Return evidence rather than throwing a generic transport error: outer catches
         // otherwise turn it into a replayable 502 and a combo/account recovery resends it.
-        if (attempt + 1 >= attempts || opts.claimAmbiguousResend?.() !== true) {
+        if (attempt + 1 >= attempts || (remainingSends && remainingSends() <= 0) || opts.claimAmbiguousResend?.() !== true) {
           return replayRefusalResponse();
         }
         spentOperatorReplacement = true;
       }
       sawReset = true;
       lastError = err;
+      recovery = "connection-reset";
       console.warn(
         `[upstream-retry] connection reset${opts.label ? ` (${opts.label})` : ""} — ${
           spentOperatorReplacement ? "replacing" : "retrying"
@@ -716,6 +797,82 @@ export async function fetchWithResetRetry(
   }
   throw lastError ?? new Error("upstream fetch failed");
   } finally { opts.onSendsConsumed?.close?.(); }
+}
+
+/** Bytes of a 5xx body read to look for a context-overflow verdict; the verdict caps its input too. */
+const CONTEXT_OVERFLOW_PEEK_BYTES = 16_384;
+/** A body that has not arrived by then is not evidence; the peek must never stall the retry. */
+const CONTEXT_OVERFLOW_PEEK_MS = 250;
+// A hypothetical, negated, or configuration-failure mention does not justify suppressing a retry.
+// Inspect the unwrapped provider message, not its JSON spelling or unrelated envelope fields.
+const NON_VERDICT_CONTEXT = /(?:\b(?:not|never|no|neither|nor|if|unless|whether)\b|n['\u2019]t\b)[^.!?\n]{0,100}\b(?:context(?:\s+(?:window|length))?|tokens?|(?:input|prompt)\s+is\s+too\s+long)\b|\b(?:context\s+(?:window|length)|token\s+limit|(?:input|prompt)\s+is\s+too\s+long)\b[^.!?\n]{0,40}\?/i;
+const CONTEXT_CONFIG_FAILURE = /\b(?:fail(?:ed|ure)?|unable|cannot|error)\b[^.!?\n]{0,100}\b(?:configuration|settings|documentation)\b|\b(?:configuration|settings|documentation)\b[^.!?\n]{0,100}\b(?:fail(?:ed|ure)?|unavailable|missing|error)\b/i;
+const CONTEXT_THROUGHPUT = /\bper (?:second|minute|hour|day)\b|\brate limit|\bquota\b|\btpm\b/i;
+
+function retryContextOverflowMessage(message: string): boolean {
+  if (CONTEXT_THROUGHPUT.test(message)) return false;
+  return message.split(/(?<=[.!?])\s+|[\r\n]+/).some(sentence => {
+    if (NON_VERDICT_CONTEXT.test(sentence) || CONTEXT_CONFIG_FAILURE.test(sentence)) return false;
+    const withoutGenericThrottle = sentence.replace(/too many tokens/gi, "");
+    return isDefiniteContextOverflow(503, withoutGenericThrottle)
+      || /\bprompt is too long\b/i.test(sentence);
+  });
+}
+
+/** Up to `maxBytes` of a clone of the body, or what arrived before the deadline. */
+async function peekBodyText(res: Response, maxBytes: number, deadlineMs: number, signal?: AbortSignal): Promise<string> {
+  const reader = res.clone().body?.getReader();
+  if (!reader) return "";
+  const decoder = new TextDecoder();
+  let text = "";
+  let bytes = 0;
+  let emptyChunks = 0;
+  const deadlineAt = performance.now() + deadlineMs;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let stop = () => {};
+  const timedOut = new Promise<null>(resolve => {
+    stop = () => resolve(null);
+    timer = setTimeout(stop, deadlineMs);
+    signal?.addEventListener("abort", stop, { once: true });
+    if (signal?.aborted) stop();
+  });
+  try {
+    while (bytes < maxBytes) {
+      if (signal?.aborted || performance.now() >= deadlineAt) break;
+      const chunk = await Promise.race([reader.read(), timedOut]);
+      if (!chunk || chunk.done) break;
+      if (chunk.value.byteLength === 0) {
+        if (++emptyChunks % 64 === 0) await new Promise<void>(resolve => setTimeout(resolve, 0));
+        continue;
+      }
+      emptyChunks = 0;
+      const bounded = chunk.value.subarray(0, maxBytes - bytes);
+      bytes += bounded.byteLength;
+      text += decoder.decode(bounded, { stream: true });
+    }
+    return text;
+  } finally {
+    clearTimeout(timer);
+    signal?.removeEventListener("abort", stop);
+    reader.cancel().catch(() => {});
+  }
+}
+
+/**
+ * True when a transient-status response's body is a definite context-overflow verdict. Peeks a
+ * clone within a byte and time bound, so the caller still receives the untouched body. A slow
+ * or endless body keeps the normal retry unless its observed prefix already proves overflow.
+ * "Too many tokens" alone is not enough here: a 5xx
+ * "Too many tokens, please wait" is a throttle that the retry exists for.
+ */
+async function isContextOverflowResponse(res: Response, signal?: AbortSignal): Promise<boolean> {
+  if ((res.headers.get("content-type") ?? "").includes("text/event-stream")) return false;
+  try {
+    const text = await peekBodyText(res, CONTEXT_OVERFLOW_PEEK_BYTES, CONTEXT_OVERFLOW_PEEK_MS, signal);
+    return text.length > 0 && isDefiniteContextOverflow(res.status, text, retryContextOverflowMessage);
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -744,18 +901,29 @@ export async function fetchWithTransientRetry(
   // `transientRetryOn5xx` policy is the first one that does, and multiplying load against an
   // already-failing provider is worse than not retrying at all.
   let sent = 0;
+  let retainedResponse = opts.retryFrom;
+  const adoptReplacement = (response: Response): Response => {
+    if (retainedResponse && retainedResponse !== response) cancelResponseBodyBestEffort(retainedResponse);
+    retainedResponse = undefined;
+    return response;
+  };
+  let recovered = 0;
+  const remainingLocal = () => budget - sent - recovered;
+  const recoveryAdmission = retryRecoveryAdmission(() => remainingLocal() > 0, () => { recovered++; });
   const countedFetch: ReplayableFetch = (recovery) => {
     // Incremented BEFORE the await so a rejected send still consumes budget; counting only
     // successes would let a reset storm loop without bound.
-    if (opts.onSendsConsumed?.beforeSend && !opts.onSendsConsumed.beforeSend()) throw new SendBudgetExhaustedError(opts.label);
+    const reserveRetrySpend = retainedResponse !== undefined || sent > 0 && opts.reserveRetrySpend?.() === true;
+    if (remaining() <= 0 || opts.onSendsConsumed?.beforeSend?.(reserveRetrySpend) === false) throw new SendBudgetExhaustedError(opts.destination ?? (opts.label ? errorDestinationLabel(opts.label) : undefined));
     sent += 1;
     const run = () => doFetch(recovery);
-    return opts.onSendsConsumed?.execute ? opts.onSendsConsumed.execute(run) : run();
+    return opts.onSendsConsumed?.execute ? opts.onSendsConsumed.execute(run, recoveryAdmission) : run();
   };
   // No floor. A spent budget hands the inner helper 0, which refuses rather than buying one
   // more send -- the loop condition alone was never enough, because every later recovery leg
   // called this helper again and the floor funded each of them.
-  const remaining = () => Math.max(0, budget - sent);
+  const remaining = () => Math.max(0, Math.min(remainingLocal(),
+    opts.remainingSends?.() ?? Infinity, opts.onSendsConsumed?.remaining?.() ?? Infinity));
   // The inner reset layer now has its own `onSendsConsumed`, and these are the same physical
   // sends `countedFetch` already counts. Forwarding the reporter down the `remaining()` path
   // would report each of them twice, which is how a four-send cap becomes a two-send cap. One
@@ -763,26 +931,41 @@ export async function fetchWithTransientRetry(
   const innerResetOptions = (): ResetRetryOptions => ({
     ...opts,
     attempts: remaining(),
+    remainingSends: remaining,
     onSendsConsumed: undefined,
+    // The offline wait belongs to the request's first send only (see below); later legs never wait.
+    offlineWait: undefined,
   });
   // Reported in `finally` rather than at each exit: this function returns from five places
   // and throws from one, and a caller sharing the budget across request legs must be told the
   // real count on every one of them.
   try {
-  if (budget === 0) throw new SendBudgetExhaustedError(opts.label);
+  if (budget === 0) throw new SendBudgetExhaustedError(opts.destination ?? (opts.label ? errorDestinationLabel(opts.label) : undefined));
   let attemptStart = Date.now();
-  let res = await fetchWithResetRetry(countedFetch, innerResetOptions());
-  for (let attempt = 0; sent < budget; attempt++) {
+  // Time spent waiting for the network to return is not part of the resend's own attempt.
+  const offlineWait = opts.offlineWait;
+  let res = adoptReplacement(await fetchWithResetRetry(countedFetch, {
+    ...innerResetOptions(),
+    ...(offlineWait ? { offlineWait: async (error: unknown, signal?: AbortSignal) => {
+      const resumed = await offlineWait(error, signal);
+      if (resumed) attemptStart = Date.now();
+      return resumed;
+    } } : {}),
+  }));
+  for (let attempt = 0; remaining() > 0; attempt++) {
     // A non-replayable gateway status was settled after the request body had already left
     // for the origin; retrying it here is the automatic resend the marker exists to forbid.
     // An upstream that answers with the exact `x-should-retry: false` verdict has said the same
     // thing about its own failure, so the ladder stops and hands the response back untouched.
     if (res.ok || !isTransientUpstreamStatus(res.status) || isNonReplayableResponse(res)
       || res.headers.get(REPLAY_REFUSAL_NO_RETRY_HEADER) === REPLAY_REFUSAL_NO_RETRY_VALUE) return res;
+    if (opts.abortSignal?.aborted || Date.now() - attemptStart > slowAttemptMs) return res;
+    // A 5xx that says the input does not fit is deterministic: resending the same body is
+    // refused the same way, so it goes back for the caller to classify (#8127).
+    if (await isContextOverflowResponse(res, opts.abortSignal)) return res;
     // Checked before cancelResponseBodyBestEffort so an already-aborted caller never receives
     // a response whose body we just cancelled.
     if (opts.abortSignal?.aborted) return res;
-    if (Date.now() - attemptStart > slowAttemptMs) return res;
     const instructedDelay = retryAfterDelayMs(res.headers);
     // The deadline is the CALLER'S, not this module's default. Reading the constant directly
     // broke it in both directions: a caller with a 30s budget slept the full 45s an upstream
@@ -797,7 +980,7 @@ export async function fetchWithTransientRetry(
       return res;
     }
     console.warn(
-      `[upstream-retry] transient ${res.status}${opts.label ? ` (${opts.label})` : ""} — retrying (${sent + 1}/${budget})`,
+      `[upstream-retry] transient ${res.status}${opts.label ? ` (${opts.label})` : ""} — retrying (${sent + recovered + 1}/${budget})`,
     );
     const delay = retryBackoffDelayMs(attempt, {
       baseDelayMs: TRANSIENT_RETRY_BASE_DELAY_MS,
@@ -805,14 +988,16 @@ export async function fetchWithTransientRetry(
       headers: res.headers,
       retryAfterIsLowerBound: true,
     });
-    cancelResponseBodyBestEffort(res);
-    // Throws on abort (see sleepWithAbort): the rejection propagates, and the body we just
-    // cancelled belonged to a response we were discarding anyway.
+    // Funded retries can lose spend admission during backoff. Keep the upstream refusal
+    // readable until the replacement is admitted.
+    if (opts.reserveRetrySpend?.()) {
+      retainedResponse = await retainPacedRetryResponse(res, opts.abortSignal, opts.readRetryResponseBody);
+    } else cancelResponseBodyBestEffort(res);
     await sleepWithAbort(delay, opts.abortSignal);
     attemptStart = Date.now();
     transientStatuses.push(res.status);
     try {
-      res = await fetchWithResetRetry(countedFetch, innerResetOptions(), "transient-5xx");
+      res = adoptReplacement(await fetchWithResetRetry(countedFetch, innerResetOptions(), "transient-5xx"));
     } catch (err) {
       // Keep the prior 5xx evidence attached: the origin already responded, so
       // this rejection is not pre-connection and must not classify as neutral.
@@ -823,12 +1008,26 @@ export async function fetchWithTransientRetry(
   }
   // Budget exhausted: the last response is returned with its body intact.
   return res;
+  } catch (err) {
+    if (!(err instanceof SendBudgetExhaustedError) || !retainedResponse) throw err;
+    const preceding = retainedResponse;
+    retainedResponse = undefined;
+    return preceding;
   } finally {
+    if (retainedResponse) cancelResponseBodyBestEffort(retainedResponse);
     try { opts.onSendsConsumed?.(sent); } finally { opts.onSendsConsumed?.close?.(); }
   }
 }
 
 export type ProtocolSafeRefetch = (signal?: AbortSignal) => Promise<Response>;
+
+/** A Responses SSE stream ended after only uncommitted protocol control frames. */
+export class ProtocolPreOutputEof extends Error {
+  constructor() {
+    super("upstream Responses stream ended before output or a terminal event");
+    this.name = "ProtocolPreOutputEof";
+  }
+}
 
 export interface ProtocolSafeRefetchOptions extends ResetRetryOptions {
   /** The replacement must match the response contract already selected for the client. */
@@ -844,7 +1043,7 @@ export interface ProtocolSafeRefetchOptions extends ResetRetryOptions {
 }
 
 /**
- * Attempt ONE caller-authorized replacement of a stream that died after the response head.
+ * Attempt ONE caller-authorized replacement of a reset or pre-output EOF after the response head.
  *
  * The caller owns the proof that nothing was observed -- it comes from protocol inspection,
  * not from this module -- and owns the physical-send budget. What lives here is the part that
@@ -857,12 +1056,14 @@ export async function refetchAfterProtocolSafeReset(
   err: unknown,
   opts: ProtocolSafeRefetchOptions = {},
 ): Promise<Response | null> {
-  if (!isConnectionResetError(err) || opts.abortSignal?.aborted || opts.attempts === 0) return null;
+  if ((!isConnectionResetError(err) && !(err instanceof ProtocolPreOutputEof))
+    || opts.abortSignal?.aborted || opts.attempts === 0) return null;
   const label = opts.label
     ? " (" + redactSecretString(opts.label).replace(/[\r\n\u0000-\u001f\u007f]/g, "").slice(0, 128) + ")"
     : "";
+  const failure = err instanceof ProtocolPreOutputEof ? "pre-output stream EOF" : "pre-output stream reset";
   if (opts.authorize && !opts.authorize()) {
-    console.warn("[upstream-retry] post-header reset replacement refused" + label + "; preserving original stream error");
+    console.warn("[upstream-retry] " + failure + " replacement refused" + label + "; preserving original stream");
     return null;
   }
   let replacement: Response;
@@ -882,7 +1083,7 @@ export async function refetchAfterProtocolSafeReset(
     console.warn("[upstream-retry] protocol-safe refetch rejected" + label + "; preserving original stream error");
     return null;
   }
-  console.warn("[upstream-retry] pre-output stream reset" + label + "; using one replacement stream");
+  console.warn("[upstream-retry] " + failure + label + "; using one replacement stream");
   return replacement;
 }
 

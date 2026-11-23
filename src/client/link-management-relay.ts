@@ -8,9 +8,11 @@
  * which attaches the link key only after the tunnel listener proves the link identity. Anything
  * outside the shared read allowlist is refused here, before a request exists.
  */
-import { HUB_RELAY_RESPONSE_BODY_MAX_BYTES } from "./hub-relay";
+import { HUB_RELAY_DEFAULT_TIMEOUT_MS, HUB_RELAY_RESPONSE_BODY_MAX_BYTES } from "./hub-relay";
 import type { LinkIngress } from "./link-ingress";
 import { relayLinkDataRequest } from "./link-relay";
+import { parseUsageSource } from "../usage/source-filter";
+import { readBoundedResponseBytes } from "../lib/bounded-body";
 import {
   LINK_MANAGEMENT_PREFIX,
   linkChildManagementRefusal,
@@ -19,6 +21,17 @@ import {
 } from "../link/management-routes";
 
 export const LINK_CHILD_READ_ONLY = "link_child_read_only";
+
+/**
+ * The one Home read a Child's local admin token may make through this relay (#8999): GOAT's passive
+ * `ocx.quota-pool/1` read. `pathname` is the parsed request path after the relay prefix, the same value
+ * the relay forwards, so a percent-encoded, doubled or case-varied spelling never matches. Everything
+ * else under the prefix stays a dashboard-session read, and the query still passes
+ * `linkManagementReadAllowed` in {@link relayLinkManagementRead}.
+ */
+export function linkChildAdminReadAllowed(method: string, pathname: string): boolean {
+  return (method === "GET" || method === "HEAD") && pathname === "/api/quota-pool";
+}
 
 export function linkChildRefusalResponse(homePhrase: string, linkId: string, operation: string): Response {
   return Response.json({
@@ -41,6 +54,15 @@ export async function relayLinkManagementRead(
   if (!linkManagementReadAllowed(req.method, pathname, new URLSearchParams(search.slice(1)))) {
     return linkChildRefusalResponse(homePhrase, linkId, `${req.method.toUpperCase()} ${pathname}`);
   }
+  const source = pathname === "/api/usage" ? parseUsageSource(new URLSearchParams(search.slice(1))) : { kind: "legacy" as const };
+  if (source.kind !== "legacy") {
+    if (source.kind !== "filtered" || source.filter.device.kind !== "key"
+      || !ingress.apiKeyId || source.filter.device.id !== ingress.apiKeyId) {
+      return Response.json({ error: "link_usage_scope_refused" }, { status: 403 });
+    }
+    // HEAD has no body in which the Home can confirm the filter; never present it as verified.
+    if (req.method.toUpperCase() === "HEAD") return new Response(null, { status: 405 });
+  }
   const admissionKey = ingress.linkKey();
   if (!admissionKey) return Response.json({ error: "link_credential_unavailable" }, { status: 503 });
   const outbound = new Request(`http://127.0.0.1${LINK_MANAGEMENT_PREFIX}${pathname}${search}`, {
@@ -48,7 +70,7 @@ export async function relayLinkManagementRead(
     headers: { accept: "application/json" },
     signal: req.signal,
   });
-  return relayLinkDataRequest(outbound, {
+  const response = await relayLinkDataRequest(outbound, {
     tunnelPort: ingress.tunnelPort,
     admissionKey,
     linkId: ingress.linkId,
@@ -58,4 +80,30 @@ export async function relayLinkManagementRead(
     bodyLimitBytes: HUB_RELAY_RESPONSE_BODY_MAX_BYTES,
     routeAllowed: linkManagementRouteAllowed,
   });
+  if (source.kind !== "filtered" || !response.ok) return response;
+  const contentType = response.headers.get("content-type")?.split(";", 1)[0]?.trim().toLowerCase();
+  if (contentType !== "application/json" && !contentType?.endsWith("+json")) {
+    try { void response.body?.cancel().catch(() => {}); } catch { /* best effort */ }
+    return Response.json({ error: "link_usage_filter_unconfirmed" }, { status: 502 });
+  }
+  try {
+    const requestedTimeout = ingress.relay?.headerTimeoutMs;
+    const deadline = requestedTimeout && requestedTimeout > 0
+      ? Math.min(requestedTimeout, HUB_RELAY_DEFAULT_TIMEOUT_MS) : HUB_RELAY_DEFAULT_TIMEOUT_MS;
+    const result = await readBoundedResponseBytes(response, { maxBytes: HUB_RELAY_RESPONSE_BODY_MAX_BYTES,
+      signal: AbortSignal.any([req.signal, AbortSignal.timeout(deadline)]), inactivityTimeoutMs: deadline });
+    if (result.oversized) throw new Error("response too large");
+    const body: unknown = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(result.bytes));
+    if (!body || typeof body !== "object" || Array.isArray(body)) throw new Error("invalid response");
+    const echo = (body as Record<string, unknown>).sourceFilter;
+    if (!echo || typeof echo !== "object" || Array.isArray(echo)) throw new Error("missing source filter");
+    const value = echo as Record<string, unknown>;
+    const device = value.device;
+    if (value.client !== source.filter.client || !device || typeof device !== "object" || Array.isArray(device)
+      || (device as Record<string, unknown>).kind !== "key"
+      || (device as Record<string, unknown>).id !== ingress.apiKeyId) throw new Error("source filter mismatch");
+    return Response.json(body, { status: response.status, headers: response.headers });
+  } catch {
+    return Response.json({ error: "link_usage_filter_unconfirmed" }, { status: 502 });
+  }
 }

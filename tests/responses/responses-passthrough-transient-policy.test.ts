@@ -34,8 +34,10 @@ describe("the Responses passthrough lane reads the provider transient policy", (
 
   test("the ladder is resolved from the provider row, not a constant", () => {
     expect(packed).toContain(dense(
-      "const transientSendPolicy = () => transientRetryPolicyFor(route.provider);\n"
-      + "const transientSendAttempts = (): number => transientSendCapFor(\n"
+      "const transientSendPolicy = () => transientRetryPolicyFor(route.provider);",
+    ));
+    expect(packed).toContain(dense(
+      "const transientSendAttempts = (): number => transientSendCapFor(\n"
       + "  transientSendPolicy()?.attempts,\n"
       + "  sendBudgetState.targetSendsUsed,\n"
       + ");",
@@ -57,10 +59,17 @@ describe("the Responses passthrough lane reads the provider transient policy", (
     const allowanceBacked = occurrences(packed, "attempts:allowance.attempts");
     const prepaidInitial = occurrences(packed, "attempts:sendBudgetState.initialSendAllowance(transientSendAttempts())");
     expect(prepaidInitial).toBe(1);
-    // Combo-owned, non-enforced sends settle at physical dispatch; every other send keeps the
-    // shared reporter, so exactly one of the two accounts for any given send.
-    expect(packed).toContain("onPhysicalDispatch:receiptMode?sendBudgetState.noteInitialDispatch:undefined");
-    expect(packed).toContain("...(receiptMode?{}:{onSendsConsumed:transientSendReporter()})");
+    // Combo receipt mode settles directly and scopes recovery without reporting the initial
+    // send. Other sends keep the shared reporter, with Copilot deferring charge until dispatch.
+    expect(packed).toContain(dense(
+      "const initialAccounting = codexWsReceiptMode(sendBudgetState.adapterSendBudget, Boolean(options.comboInitialSend))\n"
+      + "  ? { report: transientSendReporter(undefined, true), onPhysicalDispatch: sendBudgetState.noteInitialDispatch }\n"
+      + "  : copilotSendAccounting();",
+    ));
+    expect(packed).toContain("onPhysicalDispatch:recordPhysicalSend(initialAccounting.onPhysicalDispatch)");
+    expect(packed).toContain("onSendsConsumed:initialAccounting.report");
+    expect(packed).toContain("captureCodexWsRecovery:capturePhysicalSendRecovery");
+    expect(packed).toContain("=>physicalSendAccounting(transientSendReporter(permit),");
     expect(budgeted + allowanceBacked + prepaidInitial).toBe(sites);
 
     // The rebuild leg spends a recovery allowance rather than the base budget directly, so its

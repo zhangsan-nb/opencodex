@@ -34,6 +34,7 @@ function freePort(): Promise<number> {
  * a 60s Bun timeout, a 45s wait leaves the readiness probe unable to finish inside the case at
  * all — observed failing at 46-47s on macOS, which reads as a product defect and is not one.
  *
+ * The unknown-ownership negative control adds one separately bounded launcher invocation.
  * So the budget is derived from the timeout rather than guessed against it: the wait gets what
  * remains after the spawns, and the Bun timeout is stated as the sum of its parts. The deadline
  * exists to stop a HUNG proxy, not to assert a boot deadline the suite never intended to
@@ -44,8 +45,8 @@ const UPDATE_SPAWN_TIMEOUT_MS = 30_000;
 // on at least four unrelated PRs; the detached Bun proxy can take >45s to
 // serve /healthz there). 90s keeps the derived case budget honest below.
 const PROXY_READY_TIMEOUT_MS = 90_000;
-/** Spawn + readiness + teardown spawn, plus headroom for fixture IO on a loaded runner. */
-const RECOVERY_CASE_TIMEOUT_MS = UPDATE_SPAWN_TIMEOUT_MS + PROXY_READY_TIMEOUT_MS + UPDATE_SPAWN_TIMEOUT_MS + 15_000;
+/** Refusal spawn + update spawn + readiness + teardown spawn, plus fixture IO headroom. */
+const RECOVERY_CASE_TIMEOUT_MS = 3 * UPDATE_SPAWN_TIMEOUT_MS + PROXY_READY_TIMEOUT_MS + 15_000;
 
 async function waitForProxy(port: number, onFailure: (lastProbe: string) => void): Promise<boolean> {
   const deadline = Date.now() + PROXY_READY_TIMEOUT_MS;
@@ -234,7 +235,7 @@ process.on("exit", code => fixtureStatus("launcher-exit", { exitCode: code, sign
 `;
 }
 
-function instrumentRecoveryLauncher(source: string, directory: string): string {
+function instrumentRecoveryLauncher(source: string, directory: string, serviceHome?: "absent" | "unknown"): string {
   // Fail closed on drift, preserving the real calls and every original handler.
   const replaceOnce = (needle: string, replacement: string) => {
     if (source.split(needle).length !== 2) throw new Error("recovery diagnostic fixture: launcher seam changed");
@@ -244,7 +245,7 @@ function instrumentRecoveryLauncher(source: string, directory: string): string {
   const boot = 'const probe = bootRestoreProbe(resolve(here, ".."));';
   replaceOnce(boot, `fixtureStatus("boot-restore-enter");\n    ${boot}\n    fixtureStatus("boot-restore-result", { action: probe.action });`);
   replaceOnce('} catch { /* the probe must never block launch */ }', '} catch (error) { fixtureStatus("boot-restore-error", recoveryErrorFields(error)); /* the probe must never block launch */ }');
-  const runtime = 'const bunRuntime = resolveBun({ allowInstall: !codexCliUpdateInspection });';
+  const runtime = 'const bunRuntime = resolveBun({ allowInstall: !passiveSync && !orchestratedUpdate && !passiveCapabilities && !codexCliUpdateInspection, allowMissing: orchestratedUpdate || passiveSync });';
   replaceOnce(runtime, `fixtureStatus("runtime-resolution-enter");\n${runtime}\nfixtureStatus("runtime-resolved", { source: bunRuntime.source });`);
   const install = 'const r = probeSpawnSync(process.execPath, [installJs], { stdio: "inherit" });';
   replaceOnce(install, `fixtureStatus("runtime-install-enter");\n    ${install}\n    fixtureStatus("runtime-install-result", { exitCode: r.status, signal: r.signal, ...recoveryErrorFields(r.error) });`);
@@ -255,7 +256,9 @@ function instrumentRecoveryLauncher(source: string, directory: string): string {
   fixtureStatus("runtime-exit", { exitCode: code, signal });`);
   replaceOnce('child.on("error", err => {', `child.on("error", err => {
   fixtureStatus("runtime-spawn-error", recoveryErrorFields(err));`);
-  replaceOnce('const clearHandlers = () => {', 'child.on("spawn", () => fixtureStatus("runtime-spawned", { pid: child.pid }));\nconst clearHandlers = () => {');
+  replaceOnce('forwarding.attach(child);', 'forwarding.attach(child);\nchild.on("spawn", () => fixtureStatus("runtime-spawned", { pid: child.pid }));');
+  // Host service-manager availability must not choose this fixture's recovery policy.
+  if (serviceHome) replaceOnce('() => readNodeUpdateHome(authorityLauncher)', `() => ({ kind: ${JSON.stringify(serviceHome)} })`);
   return source;
 }
 const updateSource = readFileSync(join(repoRoot, "src", "update", "index.ts"), "utf8");
@@ -345,10 +348,10 @@ describe("bounded recovery diagnostics", () => {
       'import { probeSpawn, probeSpawnSync } from "../src/update/mutation-guard.mjs";',
       'const probe = bootRestoreProbe(resolve(here, ".."));',
       '} catch { /* the probe must never block launch */ }',
-      'const bunRuntime = resolveBun({ allowInstall: !codexCliUpdateInspection });',
+      'const bunRuntime = resolveBun({ allowInstall: !passiveSync && !orchestratedUpdate && !passiveCapabilities && !codexCliUpdateInspection, allowMissing: orchestratedUpdate || passiveSync });',
       'const r = probeSpawnSync(process.execPath, [installJs], { stdio: "inherit" });',
       'const child = probeSpawn(bun,', 'child.on("exit", (code, signal) => {',
-      'child.on("error", err => {', 'const clearHandlers = () => {',
+      'child.on("error", err => {', 'forwarding.attach(child);',
     ];
     for (const seam of seams) {
       expect(() => instrumentRecoveryLauncher(launcherSource.replace(seam, ""), "/fixture"))
@@ -432,13 +435,15 @@ function resolveBun() {
   const r = probeSpawnSync(process.execPath, [installJs], { stdio: "inherit" });
   return { source: "bundled", path: "fixture-bun" };
 }
-const bunRuntime = resolveBun({ allowInstall: !codexCliUpdateInspection });
+const passiveSync = false;
+const bunRuntime = resolveBun({ allowInstall: !passiveSync && !orchestratedUpdate && !passiveCapabilities && !codexCliUpdateInspection, allowMissing: orchestratedUpdate || passiveSync });
 const bun = bunRuntime.path;
+const forwarding = { attach() {}, clear() { events.push("clear"); } };
 const child = probeSpawn(bun, ["fixture-cli", "start"], childOptions);
-const clearHandlers = () => { events.push("clear"); };
-child.on("error", err => { clearHandlers(); events.push(err); process.exit(1); });
+forwarding.attach(child);
+child.on("error", err => { forwarding.clear(); events.push(err); process.exit(1); });
 child.on("exit", (code, signal) => {
-  clearHandlers();
+  forwarding.clear();
   if (signal) { process.kill(process.pid, signal); return; }
   process.exit(code ?? 1);
 });
@@ -465,7 +470,8 @@ return child;`;
       process: { argv: ["node", "fixture", "start"], pid: 123, execPath: "node", on: () => {},
         exit: (code: number) => events.push(code), kill: (pid: number, signal: string) => events.push([pid, signal]) },
       bootRestoreProbe: () => ({ action: "none" }), resolve: () => "/fixture", here: "/fixture",
-      installJs: "fixture-install", codexCliUpdateInspection: false, childOptions, events,
+      installJs: "fixture-install", orchestratedUpdate: false, passiveCapabilities: false,
+      codexCliUpdateInspection: false, childOptions, events,
     };
     const execute = new Function("io", `const { ${Object.keys(io).join(", ")} } = io;\n${source}`);
     expect(execute(io)).toBe(child);
@@ -549,6 +555,16 @@ describe("update stops the running proxy before replacing files", () => {
     expect(gateAt).toBeGreaterThan(-1);
     expect(abortAt).toBeGreaterThan(-1);
     expect(gateAt).toBeLessThan(stopAt);
+    expect(abortAt).toBeLessThan(stopAt);
+  });
+
+  test("config pre-flight runs BEFORE the stop so fallback configuration aborts before stopping services", () => {
+    const preflightAt = updateSource.indexOf("configPreflight = runConfigPreflight(configPath);");
+    const abortAt = updateSource.indexOf("aborting update before stopping services");
+    const stopAt = updateSource.indexOf('selfLaunchArgv(["stop"])');
+    expect(preflightAt).toBeGreaterThan(-1);
+    expect(abortAt).toBeGreaterThan(-1);
+    expect(preflightAt).toBeLessThan(stopAt);
     expect(abortAt).toBeLessThan(stopAt);
   });
 
@@ -655,7 +671,7 @@ describe("update stops the running proxy before replacing files", () => {
         for (const name of ["stdout", "stderr", "status"]) {
           writeFileSync(join(diagnostics, name), "", { mode: 0o600, flag: "wx" });
         }
-        writeFileSync(launcher, instrumentRecoveryLauncher(launcherSource, diagnostics));
+        writeFileSync(launcher, instrumentRecoveryLauncher(launcherSource, diagnostics, "unknown"));
         chmodSync(launcher, 0o755);
         symlinkSync(join(repoRoot, "src"), join(packageRoot, "src"), "dir");
         symlinkSync(bundledBun, join(packageRoot, "node_modules", "bun"), "dir");
@@ -678,7 +694,23 @@ esac
 `);
         chmodSync(fakeNpm, 0o755);
 
-        const result = Bun.spawnSync(["node", launcher, "update"], {
+        // Resolve wrapper-managed Node to its actual executable: wrappers can prepend
+        // their own npm directory to PATH and bypass the fixture's failing npm.
+        const node = Bun.spawnSync(["node", "-p", "process.execPath"], { stdout: "pipe" }).stdout.toString().trim();
+        const refused = Bun.spawnSync([node, launcher, "update"], {
+          cwd: root,
+          env,
+          stdout: "pipe",
+          stderr: "pipe",
+          timeout: UPDATE_SPAWN_TIMEOUT_MS,
+        });
+        const refusal = refused.stdout.toString() + refused.stderr.toString();
+        expect(refused.exitCode, refusal).toBe(1);
+        expect(refusal).toContain("service registration ownership could not be verified");
+        expect(refusal).not.toContain("Stopping the running proxy before updating");
+        expect(refusal).not.toContain(`Attempting to restart the proxy on port ${port}.`);
+        writeFileSync(launcher, instrumentRecoveryLauncher(launcherSource, diagnostics, "absent"));
+        const result = Bun.spawnSync([node, launcher, "update"], {
           cwd: root,
           env,
           stdout: "pipe",
@@ -687,7 +719,7 @@ esac
         });
         const output = result.stdout.toString() + result.stderr.toString();
 
-        expect(result.exitCode).toBe(1);
+        expect(result.exitCode, output).toBe(1);
         expect(output).toContain("Stopping the running proxy before updating");
         expect(output).toContain("restarting the previous version directly");
         expect(output).toContain("'ocx status'");
@@ -823,7 +855,7 @@ esac
     expect(stopEnvAt).toBeLessThan(replacementAt);
     expect(launcherSource.slice(lockedPlanAt, stopAt)).toContain("!runtimePlan.mayStopRuntime");
     const packageReplacement = launcherSource.slice(stopAt, launcherSource.indexOf("const postInstallPlan", stopAt));
-    expect(packageReplacement.match(/unprivilegedOwnershipMutationEnvironment/g)).toHaveLength(3); // Windows npm, POSIX npm, pnpm.
+    expect(packageReplacement.match(/unprivilegedOwnershipMutationEnvironment/g)).toHaveLength(5); // Windows npm, both POSIX npm paths, both pnpm paths.
   });
 
   test("replacement refusal reaches owner-aware recovery before releasing authority", () => {

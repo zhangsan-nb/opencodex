@@ -86,6 +86,44 @@ test("a refused user-settings apply reports failure, not success", async () => {
   }
 });
 
+test("copying the manual launch script ignores the daemon's automatic Fable fill even while editing the slot", async () => {
+  globalThis.fetch = (async () => Response.json({
+    ...SERVER,
+    authMode: "subscription",
+    tierModels: {},
+    effectiveModelEnv: { ANTHROPIC_DEFAULT_FABLE_MODEL: "claude-fable-5-2[1m]" },
+    modelMap: {},
+  })) as typeof fetch;
+  const page = await mount();
+  const originalClipboard = Object.getOwnPropertyDescriptor(navigator, "clipboard");
+  let copied = "";
+  Object.defineProperty(navigator, "clipboard", {
+    configurable: true,
+    value: { writeText: async (value: string) => { copied = value; } },
+  });
+  try {
+    await page.click(page.container.querySelector<HTMLElement>(".claude-quickstart-manual summary")!);
+    const copy = page.container.querySelector<HTMLButtonElement>(".claude-quickstart-manual button")!;
+    await page.click(copy);
+    expect(copied).toEndWith("\nclaude");
+    expect(copied).not.toContain("ANTHROPIC_DEFAULT_FABLE_MODEL");
+
+    await page.click(page.button("Fable"));
+    const model = page.testWindow.document.querySelector<HTMLElement>('[role="option"][data-value="mock/model"]')!;
+    await page.click(model);
+    expect(page.barState()).toBe("Unsaved changes");
+    copied = "";
+    await page.click(copy);
+    expect(copied).toEndWith("\nclaude");
+    expect(copied).not.toContain("ANTHROPIC_DEFAULT_FABLE_MODEL");
+  } finally {
+    if (originalClipboard) Object.defineProperty(navigator, "clipboard", originalClipboard);
+    else Reflect.deleteProperty(navigator, "clipboard");
+    await act(async () => page.root.unmount());
+    page.testWindow.close();
+  }
+});
+
 beforeEach(() => {
   clearClientResourceStoresForTests();
   const language = Object.getOwnPropertyDescriptor(globalThis.navigator, "language");
@@ -200,7 +238,7 @@ test("a late connection acknowledgement from an unmounted page reaches the page 
     await settle(page.testWindow);
     expect(enabled).toBe(false);
     expect(readSessionListCacheEntry<{ state: { enabled: boolean } }>("ocx.claude-code.v1:http://localhost")?.data?.state.enabled).toBe(false);
-    expect(page.button("Toggle Claude connection").getAttribute("aria-pressed")).toBe("false");
+    expect(page.button("Toggle Claude connection").getAttribute("aria-checked")).toBe("false");
   } finally {
     release();
     await act(async () => page.root.unmount());
@@ -357,11 +395,11 @@ for (const control of ["first-party", "connection"] as const) {
       const cached = readSessionListCacheEntry<{ state: typeof server }>("ocx.claude-code.v1:http://localhost");
       if (control === "first-party") {
         expect(server.cliFirstParty).toBe(true);
-        expect(page.button(label).getAttribute("aria-pressed")).toBe("true");
+        expect(page.button(label).getAttribute("aria-checked")).toBe("true");
         expect(cached?.data?.state.cliFirstParty).toBe(true);
       } else {
         expect(server.enabled).toBe(false);
-        expect(page.button(label).getAttribute("aria-pressed")).toBe("false");
+        expect(page.button(label).getAttribute("aria-checked")).toBe("false");
         expect(cached?.data?.state.enabled).toBe(false);
       }
     } finally {

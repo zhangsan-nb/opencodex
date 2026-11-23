@@ -3,11 +3,12 @@ import { disconnectClient } from "../client/connect";
 import { readClientConnectionState, sameClientConnectionOwner } from "../client/state";
 import { assertClientLifecycleHeld, withClientLifecycle } from "../client/lifecycle-lock";
 import { inspectRemoteDesktopCleanup, readDesktopDisconnectReceipt } from "../claude/desktop-remote-store";
-import { removeOwnedConfigState, type ConfigRemovalResult } from "../lib/config-ownership";
+import { beginConfigOwnershipTeardown, removeOwnedConfigState, type ConfigRemovalResult } from "../lib/config-ownership";
 import { windowsSecretAclReapPendingAtOrBelow } from "../lib/windows-secret-acl";
 import { supportsDesktopPicker } from "../claude/desktop-picker-platform";
 import { sharedTeardownAuthorized, type UninstallObservation } from "./uninstall-plan";
 import { cleanupOwnedIntegrationsBeforeUninstall } from "./uninstall-integrations";
+import { disconnectRecordedGatewayClients, productionGatewayClientContext } from "../integrations/gateway-clients";
 
 /** Outcome of retiring the Desktop picker profile and every picker root this install trusted. */
 export interface PickerUninstallCleanup { ok: boolean; residual?: string[] }
@@ -19,6 +20,7 @@ export interface UninstallClientStateDeps {
   disconnect: (options?: Parameters<typeof disconnectClient>[0]) => Promise<unknown>;
   withLifecycle: typeof withClientLifecycle;
   cleanupIntegrations: typeof cleanupOwnedIntegrationsBeforeUninstall;
+  gatewayContext: typeof productionGatewayClientContext;
   remove: () => ConfigRemovalResult;
   /** True while a timed-out icacls child still owns a path at or below the config directory. */
   aclReapPending: (rootPath: string) => boolean;
@@ -50,6 +52,7 @@ const defaults: UninstallClientStateDeps = {
   disconnect: options => disconnectClient(options),
   withLifecycle: withClientLifecycle,
   cleanupIntegrations: cleanupOwnedIntegrationsBeforeUninstall,
+  gatewayContext: productionGatewayClientContext,
   remove: () => removeOwnedConfigState(getConfigDir()),
   aclReapPending: rootPath => windowsSecretAclReapPendingAtOrBelow(rootPath),
   removePickerArtifacts: removePickerArtifactsBeforeUninstall,
@@ -63,6 +66,20 @@ export async function removeOwnedConfigAfterDesktopCleanup(
   if (!sharedTeardownAuthorized(observed)) {
     throw new Error("Client cleanup refused: service or proxy teardown is not proven.");
   }
+  if (typeof deps?.gatewayContext !== "function") {
+    throw new Error("Client cleanup refused: injected dependencies require a gateway context.");
+  }
+  // A rerun after an interrupted uninstall finds the tombstone; this process's own cleanup steps
+  // (picker, disconnect, integrations) still register state, which the remover below then removes.
+  const endTeardown = beginConfigOwnershipTeardown();
+  try {
+    return await removeOwnedConfigInTeardown(deps);
+  } finally {
+    endTeardown();
+  }
+}
+
+async function removeOwnedConfigInTeardown(deps: UninstallClientStateDeps): Promise<ConfigRemovalResult> {
   const state = deps.readConnection();
   if (state.kind !== "connected" && state.kind !== "disconnected") {
     throw new Error("Client cleanup refused: connection state is invalid or mismatched.");
@@ -123,6 +140,7 @@ export async function removeOwnedConfigAfterDesktopCleanup(
     // Integration records are the authority that permits removing only OpenCodex-owned fragments
     // from third-party files. Delete them only after every recorded contribution is retired.
     await deps.cleanupIntegrations();
+    disconnectRecordedGatewayClients(deps.gatewayContext(), held);
     return deps.remove();
   });
 }

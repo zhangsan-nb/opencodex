@@ -1,3 +1,6 @@
+import type { FailureDetail } from "../lib/failure-detail";
+import { boundedModelIdentity, knownModelIdentity } from "../lib/model-identity";
+import { boundedServiceTier } from "../lib/response-service-tier";
 import { createHash, type Hash } from "node:crypto";
 import { chmodSync, closeSync, existsSync, fstatSync, mkdirSync, openSync, readFileSync, readSync, appendFileSync } from "node:fs";
 import { join } from "node:path";
@@ -5,8 +8,11 @@ import { getConfigDir } from "../config";
 import type { CodexAffinityMove, CodexAffinityReason } from "../codex/routing";
 import { enforceAppOwnedMemoryBudget } from "../lib/app-owned-memory";
 import { recordOwnedConfigPath } from "../lib/config-ownership";
-import { redactSecretString, sanitizeLogMetadataString } from "../lib/redact";
+import { sanitizeLogMetadataString } from "../lib/redact";
 import { usageDisplayTotalTokens } from "./totals";
+import type { CacheTelemetryProvenance } from "./cache-provenance";
+import { linkLogField, type LinkRequestLogCarrier } from "./link-log-fields";
+import { normalizeRecordedClient, type UsageClient } from "./client";
 import {
   normalizePersistedJevDecision,
   type PersistedJevDecisionV1,
@@ -18,11 +24,14 @@ import {
   type RequestCloseReason,
   type RequestTerminalStatus,
 } from "./request-outcome";
-import type { AttemptTierOutcome, OcxUsage } from "../types";
+import type { AttemptTierOutcome, CacheAffinityLogReason, CacheAffinityOutcome, OcxUsage } from "../types";
 import { normalizeRouteDecisionTrace, type RouteDecisionTraceV1 } from "../routing/trace";
 import { parseProtocolTraceV1, type ProtocolTraceV1 } from "../protocols/dto";
+import { requestBodyField, type RequestBodyFacts } from "./request-body";
 import { ACCOUNT_LOG_LABEL_RE, CODEX_ACCOUNT_LOG_LABEL_RE } from "../codex/account-label";
 import { claudeCompatibilityReason, normalizeClaudeFeatureCodes, type ClaudeFeatureCode } from "../claude/compatibility";
+import type { UpstreamCondition } from "../lib/upstream-condition";
+import { errorDetailFor, normalizeLogErrorCode } from "./error-detail";
 import type { CodexWsStageRecord, CodexWsTerminalEvent } from "../server/responses/codex-ws-wire";
 import {
   ATTEMPT_RECOVERY_KIND_ROSTER,
@@ -88,19 +97,15 @@ export function isCodexPoolAccountLogLabel(value: unknown): value is "main" | `p
   return value === "main" || (typeof value === "string" && CODEX_ACCOUNT_LOG_LABEL_RE.test(value));
 }
 
+/** Anthropic pool account tag (#8383): exactly the `p<hex6>` label of its logged provider, nothing else. */
+export function isAnthropicAccountTag(value: unknown): value is `p${string}` {
+  return typeof value === "string" && CODEX_ACCOUNT_LOG_LABEL_RE.test(value);
+}
+
 /** Request-time upstream credential class, never a credential or account identifier. */
 export type UsageCredentialSource = "grok-oauth" | "xai-api-key";
 
-/**
- * Where a row's cache-token detail came from.
- *
- * Strict-client normalization emits zero-default token-detail objects on every bridged wire
- * (`responsesUsage` in src/bridge.ts), so a `cached_tokens: 0` read back off that wire is a
- * wire-compatibility artifact and not a measured cache miss. The three values stay distinct all
- * the way to the summary because folding `synthesized` or `unknown` into `observed` is what
- * lets a pool that discarded every warm prefix still report a plausible cache hit rate (#4546).
- */
-export type CacheTelemetryProvenance = "observed" | "synthesized" | "unknown";
+export { classifyCacheTelemetryProvenance, type CacheTelemetryProvenance } from "./cache-provenance";
 
 const KNOWN_CACHE_PROVENANCE = new Set<CacheTelemetryProvenance>([
   "observed", "synthesized", "unknown",
@@ -108,27 +113,6 @@ const KNOWN_CACHE_PROVENANCE = new Set<CacheTelemetryProvenance>([
 
 export function isKnownCacheTelemetryProvenance(value: unknown): value is CacheTelemetryProvenance {
   return typeof value === "string" && KNOWN_CACHE_PROVENANCE.has(value as CacheTelemetryProvenance);
-}
-
-/**
- * Classify one usage record's cache detail.
- *
- * `wireParsed` means the counts were read back off a response wire rather than reported raw by
- * the adapter. An all-zero cache detail from that source cannot be told apart from the zero
- * defaults the normalizer writes, so it is `synthesized`; the same shape reported raw is a real
- * zero and stays `observed`. A record with no cache fields at all is `unknown`, which is not a
- * zero either.
- */
-export function classifyCacheTelemetryProvenance(
-  usage: OcxUsage | undefined,
-  options: { wireParsed?: boolean } = {},
-): CacheTelemetryProvenance {
-  if (!usage) return "unknown";
-  const present = [usage.cachedInputTokens, usage.cacheReadInputTokens, usage.cacheCreationInputTokens]
-    .filter((value): value is number => typeof value === "number" && Number.isFinite(value));
-  if (present.length === 0) return "unknown";
-  if (present.some(value => value > 0)) return "observed";
-  return options.wireParsed === true ? "synthesized" : "observed";
 }
 
 export interface PersistedUsageAttempt {
@@ -165,6 +149,8 @@ export interface PersistedUsageAttempt {
   locallyAnswered?: boolean;
   /** Stable non-PII identity for the Codex pool account that served this attempt. */
   accountLogLabel?: CodexUsageAccountLogLabel;
+  /** Anthropic pool account that served this attempt: the p-label of its provider (#8383). */
+  accountTag?: `p${string}`;
   inputTokenEstimate?: number;
   usage?: OcxUsage;
   totalTokens?: number;
@@ -296,9 +282,11 @@ export function normalizeRequestSpend(value: unknown): PersistedRequestSpend | u
   };
 }
 
-export interface PersistedUsageEntry {
+export interface PersistedUsageEntry extends LinkRequestLogCarrier {
   requestedAlias?: string;
   requestId: string;
+  /** Best-effort classified client; absent only for records predating attribution. */
+  client?: UsageClient;
   /**
    * Identity of the ONE logical request this row belongs to (#4546), minted by
    * `createRequestExecutionBudget` at ingress. `requestId` identifies a log row; a retry layer,
@@ -317,6 +305,8 @@ export interface PersistedUsageEntry {
   inboundProtocol?: "responses" | "chat" | "messages";
   /** Stable non-PII identity for Codex Pool usage; absent for Direct/non-Codex traffic. */
   accountLogLabel?: CodexUsageAccountLogLabel;
+  /** Anthropic pool account of the row's provider (#8383); never read by account summaries. */
+  accountTag?: `p${string}`;
   /** Best-effort chat/session correlation for Logs grouping (#330). */
   conversationId?: string;
   resolvedModel?: string;
@@ -370,8 +360,17 @@ export interface PersistedUsageEntry {
    */
   terminalStatus?: RequestTerminalStatus;
   closeReason?: RequestCloseReason;
-  /** Already redacted + capped at capture (request-log.ts redactSecretString().slice(0,500)). */
+  /**
+   * Legacy input only: older rows carried upstream error text here. It is read once on load to
+   * derive upstreamCondition / rateLimitResetAt and is never written or returned.
+   */
   upstreamError?: string;
+  /** Proxy-classified upstream condition (src/lib/upstream-condition.ts); a closed enum. */
+  upstreamCondition?: UpstreamCondition;
+  /** Provider quota window end in epoch ms, derived server-side and bounded (src/usage/error-detail.ts). */
+  rateLimitResetAt?: number;
+  /** Proxy-authored failure text (src/server/request-log-failure-detail.ts), never upstream text. */
+  failureDetail?: FailureDetail;
   /** Where the terminal/failure was observed; absent on historic rows. */
   transportPhase?: "pre_headers" | "mid_stream" | "terminal_sse";
   /** Whether the terminal came from upstream or a proxy-generated tail. */
@@ -383,6 +382,9 @@ export interface PersistedUsageEntry {
    */
   affinity?: CodexAffinityMove;
   affinityReason?: CodexAffinityReason;
+  /** Provider cache-affinity outcome for key-pool routes; additive, older rows omit it. */
+  cacheAffinity?: CacheAffinityOutcome;
+  cacheAffinityReason?: CacheAffinityLogReason;
   /**
    * Set when this request dropped account-bound continuation after a Codex pool
    * account change. Never an account identifier.
@@ -403,6 +405,8 @@ export interface PersistedUsageEntry {
    * rows and rows that fail validation carry none, and are never back-filled by guessing.
    */
   protocolTrace?: ProtocolTraceV1;
+  /** The request body as received (#3023): wire bytes, Content-Encoding, decoded bytes. Absent on older rows. */
+  requestBody?: RequestBodyFacts;
   /**
    * How far this request got and why it failed (#2366). Projected from the attempt that ended
    * the request so every surface reads the answer off the same row. Absent on a completed
@@ -507,10 +511,10 @@ export function isKnownTerminalSource(value: unknown): value is NonNullable<Pers
  * call site and it never reached disk for exactly that reason.
  */
 const KNOWN_AFFINITY_MOVES = new Set<NonNullable<PersistedUsageEntry["affinity"]>>([
-  "reused", "held", "detour", "rebound", "new_bind", "cleared",
+  "reused", "held", "detour", "rebound", "new_bind", "cleared", "unbound",
 ]);
 const KNOWN_AFFINITY_REASONS = new Set<NonNullable<PersistedUsageEntry["affinityReason"]>>([
-  "healthy", "quota_headroom", "quota_refusal", "transient", "transient_hold_expired",
+  "healthy", "no_conversation", "request_owned", "quota_headroom", "quota_refusal", "transient", "transient_hold_expired",
   "unusable", "paused", "plan_excluded", "credits_off", "cooldown", "quota_avoided", "generation",
   "expired", "model_lane",
 ]);
@@ -524,6 +528,21 @@ export function isKnownAffinityMove(value: unknown): value is NonNullable<Persis
 
 export function isKnownAffinityReason(value: unknown): value is NonNullable<PersistedUsageEntry["affinityReason"]> {
   return typeof value === "string" && KNOWN_AFFINITY_REASONS.has(value as NonNullable<PersistedUsageEntry["affinityReason"]>);
+}
+
+const KNOWN_CACHE_AFFINITY = new Set<NonNullable<PersistedUsageEntry["cacheAffinity"]>>([
+  "kept", "bound", "released",
+]);
+const KNOWN_CACHE_AFFINITY_REASONS = new Set<NonNullable<PersistedUsageEntry["cacheAffinityReason"]>>([
+  "cache", "session", "turn", "continuation", "new", "quota", "auth",
+]);
+
+export function isKnownCacheAffinity(value: unknown): value is NonNullable<PersistedUsageEntry["cacheAffinity"]> {
+  return typeof value === "string" && KNOWN_CACHE_AFFINITY.has(value as NonNullable<PersistedUsageEntry["cacheAffinity"]>);
+}
+
+export function isKnownCacheAffinityReason(value: unknown): value is NonNullable<PersistedUsageEntry["cacheAffinityReason"]> {
+  return typeof value === "string" && KNOWN_CACHE_AFFINITY_REASONS.has(value as NonNullable<PersistedUsageEntry["cacheAffinityReason"]>);
 }
 
 export function usageLogPath(configDir?: string): string {
@@ -591,7 +610,9 @@ function normalizeUsageValue(usage: OcxUsage | undefined): OcxUsage | undefined 
     ...(typeof usage.cacheCreationInputTokens === "number" ? { cacheCreationInputTokens: usage.cacheCreationInputTokens } : {}),
     ...(typeof usage.cacheCreation1hInputTokens === "number" ? { cacheCreation1hInputTokens: usage.cacheCreation1hInputTokens } : {}),
     ...(typeof usage.reasoningOutputTokens === "number" ? { reasoningOutputTokens: usage.reasoningOutputTokens } : {}),
-    ...(isNonNegativeFiniteNumber(usage.providerCredits) ? { providerCredits: usage.providerCredits } : {}),
+    // Persist invalid readings as a JSON-safe negative sentinel, so they cannot become
+    // indistinguishable from a missing reading after serialization.
+    ...(usage.providerCredits !== undefined ? { providerCredits: isNonNegativeFiniteNumber(usage.providerCredits) ? usage.providerCredits : -1 } : {}),
     ...(usage.estimated ? { estimated: true } : {}),
   };
 }
@@ -636,7 +657,6 @@ function normalizeAttemptUsage(raw: unknown): OcxUsage | null {
     "cacheCreationInputTokens",
     "cacheCreation1hInputTokens",
     "reasoningOutputTokens",
-    "providerCredits",
   ] as const) {
     if (key in usage && !isNonNegativeFiniteNumber(usage[key])) return null;
   }
@@ -672,7 +692,7 @@ function normalizeAttemptTierOutcome(raw: unknown): AttemptTierOutcome | null {
   if ("responseServiceTier" in outcome && typeof outcome.responseServiceTier !== "string") return null;
   if ("responseTierAuthoritative" in outcome && typeof outcome.responseTierAuthoritative !== "boolean") return null;
   const wireValue = sanitizeLogMetadataString(outcome.wireValue);
-  const responseServiceTier = sanitizeLogMetadataString(outcome.responseServiceTier);
+  const responseServiceTier = boundedServiceTier(outcome.responseServiceTier);
   return {
     ...(outcome.canonical === "priority" ? { canonical: "priority" as const } : {}),
     ...(outcome.wireKind === null
@@ -750,6 +770,7 @@ function normalizeUsageAttempt(raw: unknown): PersistedUsageAttempt | null {
         && ATTEMPT_RECOVERY_WITHHELD.has(value as AttemptRecoveryWithheld),
     ))]
     : [];
+  const attemptErrorCode = normalizeLogErrorCode(attempt.errorCode, attempt.status as number);
   return {
     ordinal: attempt.ordinal as number,
     provider: attempt.provider,
@@ -774,6 +795,7 @@ function normalizeUsageAttempt(raw: unknown): PersistedUsageAttempt | null {
     ...(isCodexUsageAccountLogLabel(attempt.accountLogLabel)
       ? { accountLogLabel: attempt.accountLogLabel }
       : {}),
+    ...(isAnthropicAccountTag(attempt.accountTag) ? { accountTag: attempt.accountTag } : {}),
     ...(isNonNegativeFiniteNumber(attempt.inputTokenEstimate)
       ? { inputTokenEstimate: attempt.inputTokenEstimate }
       : {}),
@@ -781,7 +803,7 @@ function normalizeUsageAttempt(raw: unknown): PersistedUsageAttempt | null {
     ...(isNonNegativeFiniteNumber(attempt.totalTokens)
       ? { totalTokens: attempt.totalTokens }
       : {}),
-    ...(typeof attempt.errorCode === "string" ? { errorCode: attempt.errorCode } : {}),
+    ...(attemptErrorCode ? { errorCode: attemptErrorCode } : {}),
     ...(isKnownCacheTelemetryProvenance(attempt.cacheProvenance)
       ? { cacheProvenance: attempt.cacheProvenance }
       : {}),
@@ -896,19 +918,9 @@ function capMetadataString(s: string): string {
   return s.length > MAX_METADATA_STRING_LEN ? s.slice(0, MAX_METADATA_STRING_LEN) : s;
 }
 
-const MAX_SERVED_MODEL_LENGTH = 200;
-/**
- * An upstream model is an identifier, never free-form text to truncate into one. A value the
- * secret redactor would change is dropped rather than logged, because credential-shaped text can
- * fit the identifier alphabet.
- */
+/** Served and resolved models on a row use the shared model-identity bound (src/lib/model-identity.ts). */
 export function sanitizeServedModel(value: unknown): string | undefined {
-  return typeof value === "string"
-    && value.length <= MAX_SERVED_MODEL_LENGTH
-    && /^[A-Za-z0-9._:/@+-]+$/.test(value)
-    && redactSecretString(value) === value
-    ? value
-    : undefined;
+  return boundedModelIdentity(value);
 }
 
 /** The identity fields that decide whether a response model is ocx's own echo. */
@@ -941,28 +953,56 @@ export function isClientSelectorEcho(source: ServedModelEchoSource, served: stri
 
 /** Record a response-body model as the served model when it is a real upstream observation. */
 export function recordObservedServedModel(
-  target: ServedModelEchoSource & { servedModel?: string; resolvedModel?: string; preserveResolvedModelFromRoute?: boolean },
+  target: ServedModelEchoSource & { servedModel?: string; resolvedModel?: string; preserveResolvedModelFromRoute?: boolean; attempts?: unknown },
   value: unknown,
 ): void {
-  const servedModel = sanitizeServedModel(value);
+  const servedModel = knownModelIdentity(value, routeKnownModels(target), target.provider);
   if (!servedModel || isClientSelectorEcho(target, servedModel)) return;
   target.servedModel = servedModel;
   if (!target.preserveResolvedModelFromRoute) target.resolvedModel = servedModel;
 }
 
 /**
+ * Model ids a row's own route already names, which an upstream-reported served or resolved model
+ * must equal to be recorded: the routed model (also without its provider prefix), the wire model,
+ * the requested model and alias, and each attempt's target. The bundled Codex catalog is checked
+ * by {@link knownModelIdentity} itself.
+ */
+export function routeKnownModels(source: ServedModelEchoSource & { attempts?: unknown }): string[] {
+  const known: string[] = [];
+  const add = (value: unknown) => { if (typeof value === "string" && value) known.push(value); };
+  add(source.model);
+  if (typeof source.model === "string" && source.model.includes("/")) add(source.model.slice(source.model.indexOf("/") + 1));
+  add(source.wireModel);
+  add(source.requestedModel);
+  add(source.requestedAlias);
+  if (Array.isArray(source.attempts)) {
+    for (const attempt of source.attempts as unknown[]) {
+      if (attempt && typeof attempt === "object") {
+        add((attempt as { model?: unknown }).model);
+        add((attempt as { wireModel?: unknown }).wireModel);
+      }
+    }
+  }
+  return known;
+}
+
+/**
  * Model identity fields for a log row. The served model is sanitized, and a resolvedModel that
  * only echoed a dropped served model is dropped with it, so the rejected value cannot survive
  * under the other name. A client-selector echo is dropped the same way, which also repairs
- * rows persisted before the echo was filtered at capture.
+ * rows persisted before the echo was filtered at capture. Both are kept only when they equal a
+ * model id the row's route already names (or the bundled catalog pins); see {@link knownModelIdentity}.
  */
-export function modelIdentityLogFields(source: ServedModelEchoSource & { resolvedModel?: string; servedModel?: unknown }): {
+export function modelIdentityLogFields(source: ServedModelEchoSource & { resolvedModel?: string; servedModel?: unknown; attempts?: unknown }): {
   resolvedModel?: string; servedModel?: string; wireModel?: string;
 } {
-  const sanitized = sanitizeServedModel(source.servedModel);
+  const known = routeKnownModels(source);
+  const sanitized = knownModelIdentity(source.servedModel, known, source.provider);
   const servedModel = isClientSelectorEcho(source, sanitized) ? undefined : sanitized;
+  // The resolved model passes the same validator on its own; it also leaves with a dropped served echo.
   const resolvedModel = source.servedModel !== undefined && source.resolvedModel === source.servedModel && !servedModel
-    ? undefined : source.resolvedModel;
+    ? undefined : knownModelIdentity(source.resolvedModel, known, source.provider);
   return {
     ...(resolvedModel ? { resolvedModel } : {}),
     ...(servedModel ? { servedModel } : {}),
@@ -979,7 +1019,7 @@ function normalizeUsageEntry(entry: PersistedUsageEntry): PersistedUsageEntry {
   const attempts = normalizedAttempts(entry.attempts);
   const tierOutcome = entry.tierOutcome ? normalizeAttemptTierOutcome(entry.tierOutcome) : undefined;
   const callerServiceTier = sanitizeLogMetadataString(entry.callerServiceTier);
-  const responseServiceTier = sanitizeLogMetadataString(entry.responseServiceTier);
+  const responseServiceTier = boundedServiceTier(entry.responseServiceTier);
   const shadowCallRewrittenFrom = sanitizeLogMetadataString(entry.shadowCallRewrittenFrom);
   const { servedModel, resolvedModel } = modelIdentityLogFields(entry);
   const claudeCompatibility = normalizeClaudeCompatibilityUsageLog(entry.claudeCompatibility);
@@ -989,6 +1029,10 @@ function normalizeUsageEntry(entry: PersistedUsageEntry): PersistedUsageEntry {
   // A reason without a move describes nothing, so it is only kept alongside one.
   const affinityReason = affinity !== undefined && isKnownAffinityReason(entry.affinityReason)
     ? entry.affinityReason
+    : undefined;
+  const cacheAffinity = isKnownCacheAffinity(entry.cacheAffinity) ? entry.cacheAffinity : undefined;
+  const cacheAffinityReason = cacheAffinity !== undefined && isKnownCacheAffinityReason(entry.cacheAffinityReason)
+    ? entry.cacheAffinityReason
     : undefined;
   const conversationStateScrub = typeof entry.conversationStateScrub === "string"
     && KNOWN_CONVERSATION_STATE_SCRUBS.has(entry.conversationStateScrub)
@@ -1002,6 +1046,7 @@ function normalizeUsageEntry(entry: PersistedUsageEntry): PersistedUsageEntry {
   const protocolTrace = parseProtocolTraceV1(entry.protocolTrace);
   const normalized: PersistedUsageEntry = {
     requestId: entry.requestId,
+    ...(Object.hasOwn(entry, "client") ? { client: normalizeRecordedClient(entry.client) ?? "unknown" } : {}),
     ...(isLogicalRequestId(entry.logicalRequestId) ? { logicalRequestId: entry.logicalRequestId } : {}),
     timestamp: entry.timestamp,
     provider: entry.provider,
@@ -1016,9 +1061,11 @@ function normalizeUsageEntry(entry: PersistedUsageEntry): PersistedUsageEntry {
       : {}),
     ...(isKnownAdmissionKind(entry.admissionKind) ? { admissionKind: entry.admissionKind } : {}),
     ...(isKnownInboundProtocol(entry.inboundProtocol) ? { inboundProtocol: entry.inboundProtocol } : {}),
+    ...linkLogField(entry.link),
     ...(isCodexUsageAccountLogLabel(entry.accountLogLabel)
       ? { accountLogLabel: entry.accountLogLabel }
       : {}),
+    ...(isAnthropicAccountTag(entry.accountTag) ? { accountTag: entry.accountTag } : {}),
     ...(typeof entry.conversationId === "string" && entry.conversationId.trim()
       ? { conversationId: entry.conversationId.trim().slice(0, 128) }
       : {}),
@@ -1085,18 +1132,21 @@ function normalizeUsageEntry(entry: PersistedUsageEntry): PersistedUsageEntry {
     ...(terminalSource ? { terminalSource } : {}),
     ...(affinity ? { affinity } : {}),
     ...(affinityReason ? { affinityReason } : {}),
+    ...(cacheAffinity ? { cacheAffinity } : {}),
+    ...(cacheAffinityReason ? { cacheAffinityReason } : {}),
     ...(conversationStateScrub ? { conversationStateScrub } : {}),
-    ...(entry.errorCode ? { errorCode: entry.errorCode } : {}),
+    // Closed code, classified condition and numeric reset only; upstream text is never kept.
+    ...errorDetailFor(entry),
     // Validated rather than copied on truthiness, like the inbound protocol and transport phase
     // above. Harmless while these were only rendered; not harmless once the terminal status is
     // a grouping-key slot, because the string is assembled from an upstream frame.
     ...(isRequestTerminalStatus(entry.terminalStatus) ? { terminalStatus: entry.terminalStatus } : {}),
     ...(isRequestCloseReason(entry.closeReason) ? { closeReason: entry.closeReason } : {}),
-    ...(entry.upstreamError ? { upstreamError: entry.upstreamError } : {}),
     ...(routeDecision ? { routeDecision } : {}),
     ...(jevDecision ? { jevDecision } : {}),
     ...(claudeCompatibility ? { claudeCompatibility } : {}),
     ...(protocolTrace ? { protocolTrace } : {}),
+    ...requestBodyField(entry.requestBody),
     ...normalizeRequestFailureAttribution(entry),
   };
   if (normalized.attemptNormalizationDropped !== true && (entry.attemptNormalizationDropped === true
@@ -1412,17 +1462,27 @@ function usageLogRevision(path: string, fd: number, stat: ReturnType<typeof fsta
   };
 }
 
-export function usageLogRevisionKey(revision: UsageLogRevision | null): string {
+/**
+ * ChangeTime is part of the key on POSIX only. On NTFS the config home's background icacls
+ * harden re-applies inherited ACEs to usage.jsonl and moves its ChangeTime with every other
+ * field unchanged, and content cannot change without moving mtime; counting it rebuilt the
+ * filter index and every retained aggregate. On POSIX it still exposes an mtime-restoring rewrite.
+ */
+export function usageLogRevisionKey(
+  revision: UsageLogRevision | null,
+  platform: NodeJS.Platform = process.platform,
+): string {
   if (!revision) return "missing";
-  return [
+  const parts: Array<string | number> = [
     revision.path,
     revision.dev,
     revision.ino,
     revision.birthtimeMs,
     revision.size,
     revision.mtimeMs,
-    revision.ctimeMs,
-  ].join("\0");
+  ];
+  if (platform !== "win32") parts.push(revision.ctimeMs);
+  return parts.join("\0");
 }
 
 /** Identity of the usage ledger file, excluding size/mtime/ctime so appends can share work. */
