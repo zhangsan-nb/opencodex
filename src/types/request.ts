@@ -87,6 +87,18 @@ export interface OcxParsedRequest {
    */
   _summaryProhibitsToolCalls?: boolean;
   /**
+   * Routed Anthropic compaction summary: the caller's hosted web_search, kept aside from
+   * `_webSearch` so the summary declares the synthetic tool the ordinary request would declare
+   * without ever running the sidecar (#7307).
+   */
+  _summaryWebSearch?: Record<string, unknown>;
+  /**
+   * Compaction request after a decoded checkpoint. The parser withholds the continuation note from
+   * every summary; a prefix-preserving route adds it back where the ordinary request carries it,
+   * so the summary keeps that request's system prompt (#7307).
+   */
+  _summaryCheckpointNote?: boolean;
+  /**
    * Completed server-tool exchanges from the Claude client's history, keyed by the block that
    * followed them (`call:<tool_use id>` / `text:<text>`). Same audience as `_anthropicServerTools`.
    */
@@ -104,6 +116,8 @@ export interface OcxParsedRequest {
    * CLIENT already carried that history verbatim and the proxy skipped the prepend.
    */
   _replayPrefixLen?: number;
+  /** First parsed message eligible as current input. Recomputed when a projection removes historical messages. */
+  _currentInputMessageStart?: number;
   /** Parsed-message index before the first conversational item in a continuation's current delta. */
   _continuationConversationMessageIndex?: number;
   /**
